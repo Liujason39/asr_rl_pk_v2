@@ -12,7 +12,7 @@ import torch
 from collections import deque
 
 import asr_rl_pk
-from asr_rl_pk.algorithms import PPO, Distillation, PPO_DWAQ
+from asr_rl_pk.algorithms import PPO, Distillation, PPO_DWAQ, PPO_DWAQPP
 from asr_rl_pk.env import VecEnv
 from asr_rl_pk.modules import (
     ActorCritic,
@@ -24,7 +24,8 @@ from asr_rl_pk.modules import (
     VisualActorCritic,
     VisStudentTeacher,
     VisStudentTeacherRecurrent,
-    dwaq_policy
+    dwaq_policy,
+    dwaqpp_policy
 )
 from asr_rl_pk.utils import store_code_state
 
@@ -44,6 +45,8 @@ class DWAQPolicyRunner:
 
         # resolve training type depending on the algorithm
         if self.alg_cfg["class_name"] == "PPO_DWAQ":
+            self.training_type = "rl"
+        elif self.alg_cfg["class_name"] == "PPO_DWAQPP":
             self.training_type = "rl"
         elif self.alg_cfg["class_name"] == "Distillation":
             self.training_type = "distillation"
@@ -82,13 +85,31 @@ class DWAQPolicyRunner:
             self.true_velocity_type = self.policy_cfg['true_velocity']
             num_true_velocity_obs = extras["observations"][self.true_velocity_type].shape[1]
             self.hist_length = self.policy_cfg['history_length']
+        elif self.policy_cfg["class_name"] == "dwaqpp_policy":
+            self.privileged_obs_type = self.policy_cfg["privileged_obs"]
+            self.gt_heightmap_type = self.policy_cfg["gt_heightmap"]
+            self.true_velocity_type = self.policy_cfg["true_velocity"]
+            self.visual_obs_type = self.policy_cfg["visual"]
+
+            num_privileged_obs = extras["observations"][self.privileged_obs_type].shape[1]
+            num_gt_heightmap_obs = extras["observations"][self.gt_heightmap_type].shape[1]
+            num_true_velocity_obs = extras["observations"][self.true_velocity_type].shape[1]
+            num_visual_obs = extras["observations"][self.visual_obs_type].shape[1]
+            self.hist_length = self.policy_cfg["history_length"]
         else:
             raise ValueError(f"Not supported policy class: {self.policy_cfg['class_name']}.")
 
-        policy_class = eval(self.policy_cfg.pop("class_name"))
-        policy: dwaq_policy = policy_class(
-            num_obs, num_privileged_obs, num_gt_heightmap_obs, num_true_velocity_obs, self.env.num_actions, **self.policy_cfg
-        ).to(self.device)
+        self.policy_class_name = self.policy_cfg.pop("class_name")
+        if self.policy_class_name == "dwaq_policy":
+            policy = dwaq_policy(
+                num_obs, num_privileged_obs, num_gt_heightmap_obs, num_true_velocity_obs, self.env.num_actions, **self.policy_cfg
+            ).to(self.device)
+        elif self.policy_class_name == "dwaqpp_policy":
+            policy = dwaqpp_policy(
+                num_obs, num_privileged_obs, num_gt_heightmap_obs, num_true_velocity_obs, num_visual_obs, self.env.num_actions, **self.policy_cfg
+            ).to(self.device)
+        else:
+            raise ValueError(f"Not supported policy class: {self.policy_class_name}.")
 
         # resolve dimension of rnd gated state
         if "rnd_cfg" in self.alg_cfg and self.alg_cfg["rnd_cfg"] is not None:
@@ -109,10 +130,17 @@ class DWAQPolicyRunner:
             self.alg_cfg["symmetry_cfg"]["_env"] = env
 
         # initialize algorithm
-        alg_class = eval(self.alg_cfg.pop("class_name"))
-        self.alg: PPO_DWAQ | Distillation = alg_class(
-            policy, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
-        )
+        alg_class = self.alg_cfg.pop("class_name")
+        if alg_class == "PPO_DWAQ":
+            self.alg = PPO_DWAQ(
+                policy, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
+            )
+        elif alg_class == "PPO_DWAQPP":
+            self.alg = PPO_DWAQPP(
+                policy, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg
+            )
+        else:
+            raise ValueError(f"Not supported algorithm class: {alg_class}.")
 
         # store training configuration
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
@@ -128,17 +156,31 @@ class DWAQPolicyRunner:
             self.privileged_obs_normalizer = torch.nn.Identity().to(self.device)  # no normalization
 
         # init storage and model
-        self.alg.init_storage(
-            self.training_type,
-            self.env.num_envs,
-            self.num_steps_per_env,
-            [num_obs], # since the obs will not include true_vel/est_vel
-            [num_privileged_obs],
-            [num_gt_heightmap_obs],
-            [num_true_velocity_obs],
-            [self.env.num_actions],
-            self.hist_length
-        )
+        if self.policy_class_name == "dwaq_policy":
+            self.alg.init_storage(
+                self.training_type,
+                self.env.num_envs,
+                self.num_steps_per_env,
+                [num_obs], # since the obs will not include true_vel/est_vel
+                [num_privileged_obs],
+                [num_gt_heightmap_obs],
+                [num_true_velocity_obs],
+                [self.env.num_actions],
+                self.hist_length
+            )
+        elif self.policy_class_name == "dwaqpp_policy":
+            self.alg.init_storage(
+                self.training_type,
+                self.env.num_envs,
+                self.num_steps_per_env,
+                [num_obs],
+                [num_privileged_obs],
+                [num_gt_heightmap_obs],
+                [num_true_velocity_obs],
+                [self.env.num_actions],
+                self.hist_length,
+                [num_visual_obs],
+            )
 
         # Decide whether to disable logging
         # We only log from the process with rank 0 (main process)
@@ -215,6 +257,9 @@ class DWAQPolicyRunner:
         gt_heightmap_obs = extras["observations"].get(self.policy_cfg['gt_heightmap'], obs).to(self.device)
         true_velocity_obs = extras["observations"].get(self.policy_cfg['true_velocity'], obs).to(self.device)
         gt_heightmap_obs, true_velocity_obs = gt_heightmap_obs.to(self.device), true_velocity_obs.to(self.device)
+
+        if self.policy_class_name == "dwaqpp_policy":
+            visual_obs = extras["observations"][self.visual_obs_type].to(self.device)
         
 
         self.train_mode()  # switch to train mode (for dropout for example)
@@ -309,13 +354,24 @@ class DWAQPolicyRunner:
                     # set the bootstrap probability for DWAQ
                     self.alg.set_bootstrap_prob(self.p_boot)
                     
-                    # Sample actions
-                    actions = self.alg.act(
-                        obs,
-                        privileged_obs,
-                        true_velocity_obs,
-                        gt_heightmap_obs,
-                    )
+                    if self.policy_class_name == "dwaq_policy":
+                        # Sample actions
+                        actions = self.alg.act(
+                            obs,
+                            privileged_obs,
+                            true_velocity_obs,
+                            gt_heightmap_obs,
+                        )
+                    elif self.policy_class_name == "dwaqpp_policy":
+                        actions = self.alg.act(
+                            obs,
+                            privileged_obs,
+                            true_velocity_obs,
+                            gt_heightmap_obs,
+                            visual_obs
+                        )
+                    else:
+                        raise ValueError(f"Not supported policy class: {self.policy_class_name}.")
                     
                     # Step the environment
                     obs, rewards, dones, infos = self.env.step(actions.to(self.env.device))
@@ -332,6 +388,8 @@ class DWAQPolicyRunner:
                     
                     gt_heightmap_obs = infos["observations"][self.gt_heightmap_type].to(self.device)
                     true_velocity_obs = infos["observations"][self.true_velocity_type].to(self.device)
+                    if self.policy_class_name == "dwaqpp_policy":
+                        visual_obs = infos["observations"][self.visual_obs_type].to(self.device)
 
                     # new_obs for DWAQ
                     next_obs = obs
@@ -584,6 +642,17 @@ class DWAQPolicyRunner:
         if device is not None:
             self.alg.policy.to(device)
         policy = self.alg.policy.act_inference
+        if self.cfg["empirical_normalization"]:
+            if device is not None:
+                self.obs_normalizer.to(device)
+            policy = lambda x: self.alg.policy.act_inference(self.obs_normalizer(x))  # noqa: E731
+        return policy
+    
+    def get_inference_policy_TrueVel(self, device=None):
+        self.eval_mode()  # switch to evaluation mode (dropout for example)
+        if device is not None:
+            self.alg.policy.to(device)
+        policy = self.alg.policy.act_inference_TrueVel
         if self.cfg["empirical_normalization"]:
             if device is not None:
                 self.obs_normalizer.to(device)

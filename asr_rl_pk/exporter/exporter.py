@@ -563,3 +563,110 @@ def export_dwaq_policy_as_onnx_simple(
     exporter = OnnxDwaqPolicyExporterSimple(policy, normalizer, verbose)
     out_path = str(Path(path) / filename)
     return exporter.export(out_path, opset_version=opset_version)
+
+"""=============DWAQ policy runner export calls with external velocity================="""
+
+class OnnxDwaqPolicyExporterExternalVel(nn.Module):
+    def __init__(
+        self,
+        policy: nn.Module,
+        normalizer: Optional[nn.Module] = None,
+        verbose: bool = False,
+    ):
+        super().__init__()
+        self.verbose = verbose
+        self.normalizer = copy.deepcopy(normalizer) if normalizer is not None else nn.Identity()
+        self.policy = copy.deepcopy(policy).cpu()
+
+        self.history_len = int(getattr(policy, "history_len", 5))
+
+        # infer dims
+        self.latent_dim = self.policy.proprio_encoder_mu.out_features
+        self.vel_dim = self._infer_last_linear_out_features(self.policy.vel_head)
+        actor_in_dim = self._infer_first_linear_in_features(self.policy.actor)
+
+        # actor input = [vel, obs, z_p]
+        self.obs_dim = actor_in_dim - self.latent_dim - self.vel_dim
+
+    @staticmethod
+    def _infer_last_linear_out_features(module: nn.Module) -> int:
+        for m in reversed(list(module.modules())):
+            if isinstance(m, nn.Linear):
+                return int(m.out_features)
+        raise ValueError("Cannot infer output dim.")
+
+    @staticmethod
+    def _infer_first_linear_in_features(module: nn.Module) -> int:
+        for m in module.modules():
+            if isinstance(m, nn.Linear):
+                return int(m.in_features)
+        raise ValueError("Cannot infer input dim.")
+
+    def forward(
+        self,
+        obs: torch.Tensor,
+        obs_history: torch.Tensor,
+        vel: torch.Tensor,
+    ):
+        obs = self.normalizer(obs)
+
+        action, est_v = self.policy.act_for_onnx_transfer_with_external_vel(
+            obs=obs,
+            obs_history=obs_history,
+            vel=vel,
+            use_mu=True,
+        )
+
+        return action, est_v
+
+    def export(self, out_path: str, opset_version: int = 17):
+        os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+        self.eval()
+        self.cpu()
+
+        dummy_obs = torch.zeros(1, self.obs_dim, dtype=torch.float32)
+        dummy_obs_history = torch.zeros(
+            1, self.history_len, self.obs_dim, dtype=torch.float32
+        )
+        dummy_vel = torch.zeros(1, self.vel_dim, dtype=torch.float32)
+
+        torch.onnx.export(
+            self,
+            (dummy_obs, dummy_obs_history, dummy_vel),
+            out_path,
+            export_params=True,
+            opset_version=opset_version,
+            do_constant_folding=True,
+            verbose=self.verbose,
+            input_names=["obs", "obs_history", "vel"],
+            output_names=["action", "est_v"],
+            dynamic_axes={
+                "obs": {0: "batch"},
+                "obs_history": {0: "batch"},
+                "vel": {0: "batch"},
+                "action": {0: "batch"},
+                "est_v": {0: "batch"},
+            },
+        )
+
+        return out_path
+
+
+def export_dwaq_policy_as_onnx_external_vel(
+    policy: nn.Module,
+    path: str,
+    filename: str = "dwaq_policy_external_vel.onnx",
+    normalizer: Optional[nn.Module] = None,
+    opset_version: int = 17,
+    verbose: bool = False,
+):
+    os.makedirs(path, exist_ok=True)
+
+    exporter = OnnxDwaqPolicyExporterExternalVel(
+        policy=policy,
+        normalizer=normalizer,
+        verbose=verbose,
+    )
+
+    out_path = str(Path(path) / filename)
+    return exporter.export(out_path, opset_version=opset_version)

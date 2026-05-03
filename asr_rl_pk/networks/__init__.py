@@ -7,4 +7,5 @@
 
 from .memory import Memory
 from .TemporalBuffer import TemporalBuffer
-__all__ = ["Memory", "TemporalBuffer"]
+from .TemporalBuffer_v2 import TemporalBuffer_v2
+__all__ = ["Memory", "TemporalBuffer", "TemporalBuffer_v2"]

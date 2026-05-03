@@ -9,5 +9,6 @@ from .rollout_storage import RolloutStorage
 from .encoder_rollout_storage import EncoderRolloutStorage
 from .rollout_storage_monolith import RolloutStorage_Monolith
 from .rollout_storage_DWAQ import RolloutStorageDWAQ
+from .rollout_storage_DWAQPP import RolloutStorageDWAQPP
 
-__all__ = ["RolloutStorage", "EncoderRolloutStorage", "RolloutStorage_Monolith", "RolloutStorageDWAQ"]
+__all__ = ["RolloutStorage", "EncoderRolloutStorage", "RolloutStorage_Monolith", "RolloutStorageDWAQ", "RolloutStorageDWAQPP"]

@@ -105,16 +105,13 @@ class dwaq_policy(nn.Module):
                 layers.append(activation)
             in_dim = out_dim
         self.vel_head = nn.Sequential(*layers)
-        # # VAE heads for z_p
-        # self.vel_encoder_mu = nn.Linear(vel_head_hidden_dims[-1], vel_head_hidden_dims[-1])
-        # self.vel_encoder_logvar = nn.Linear(vel_head_hidden_dims[-1], vel_head_hidden_dims[-1])
-
+        
         print(f"vel_head: {self.vel_head}")
 
 
         # Policy
         actor_layers = []
-        actor_layers.append(nn.Linear(num_true_vel_obs+proprio_hidden_dims[-1]+num_actor_obs, actor_hidden_dims[0]))
+        actor_layers.append(nn.Linear(num_true_vel_obs+num_actor_obs+proprio_hidden_dims[-1], actor_hidden_dims[0]))
         actor_layers.append(activation)
         for layer_index in range(len(actor_hidden_dims)):
             if layer_index == len(actor_hidden_dims) - 1:
@@ -153,14 +150,6 @@ class dwaq_policy(nn.Module):
             for idx, module in enumerate(mod for mod in sequential if isinstance(mod, nn.Linear))
         ]
 
-    # def kl_divergence_diag_gaussian(self, mu, logvar):
-    #     # q(z|x) = N(mu, diag(sigma^2))
-    #     # p(z)   = N(0, I)
-    #     kl = 0.5 * torch.sum(
-    #         torch.exp(logvar) + mu.pow(2) - 1.0 - logvar,
-    #         dim=-1
-    #     )
-    #     return kl.mean()
     
     def forward_proprio_vae(self, proprio_obs_seq):
         """
@@ -175,15 +164,6 @@ class dwaq_policy(nn.Module):
 
         pred_obs = self.proprio_est_decoder(z_pH)
         return z_pH, mu, clamp_logvar, pred_obs
-
-    # def reparameterize(self, mu, logvar, logvar_max=5):
-    #     # 對應論文 constrained reparameterization 的簡化實作
-    #     # sigma_max = 5 
-    #     clamp_logvar = torch.clamp(logvar, max=logvar_max)
-    #     std = torch.exp(0.5 * clamp_logvar)
-    #     eps = torch.randn_like(std)
-    #     z = mu + eps * std
-    #     return z, clamp_logvar
     
     def reparameterize(self, mu, logvar, logvar_min=-10.0, logvar_max=1.609): # log(5) = 1.609
         clamp_logvar = torch.clamp(logvar, min=logvar_min, max=logvar_max)
@@ -272,9 +252,6 @@ class dwaq_policy(nn.Module):
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)
 
-    # def act_inference(self, actor_obs):
-    #     """this will be cover by self.prepare_actor_obs()"""
-    #     return self.actor(actor_obs)
     @torch.no_grad()
     def act_inference(self, obs, return_aux=True):
         """
@@ -294,6 +271,39 @@ class dwaq_policy(nn.Module):
             true_velocity_obs=None,
             p_boot=1.0,
             inference=True,
+        )
+
+        action = self.actor(out["actor_input"])
+
+        if return_aux:
+            return action, {
+                "est_vel": out["est_vel"],
+                "mu_p": out["mu_p"],
+                "z_p": out["z_p"],
+                "obs_history": out["obs_history"],
+            }
+        return action
+    
+    @torch.no_grad()
+    def act_inference_TrueVel(self, obs, true_velocity_obs, return_aux=True):
+        """
+        Inference-time action generation using only current observation.
+        Internal history buffer will be updated automatically.
+
+        Args:
+            obs: Tensor of shape [B, num_actor_obs]
+            true_velocity_obs: Tensor of shape [B, num_true_vel_obs]
+            return_aux: whether to also return estimated auxiliary outputs
+
+        Returns:
+            action: Tensor of shape [B, num_actions]
+            optionally a dict containing est_vel / mu_p / obs_hist / actor_obs
+        """
+        out = self.prepare_actor_obs(
+            actor_obs=obs,
+            true_velocity_obs=true_velocity_obs,
+            p_boot=0.0,
+            inference=False,
         )
 
         action = self.actor(out["actor_input"])
@@ -427,48 +437,7 @@ class dwaq_policy(nn.Module):
             "vel_for_actor": vel_for_actor,
             "boot_mask": used_boot_mask,
         }
-    # def prepare_actor_obs(self, actor_obs):
-    #     """
-    #     obs_dict should provide:
-    #     - proprio_obs: [B, num_actor_obs]
-    #     - true_vel_obs: [B, num_true_vel_obs]
-    #     """
 
-    #     proprio_obs = actor_obs
-
-    #     # 1) 更新 proprio history
-    #     proprio_hist = self.proprio_hist_buffer.append(proprio_obs)
-
-    #     # 2) proprio VAE
-    #     z_p, mu_p, logvar_p, pred_obs = self.forward_proprio_vae(proprio_hist)
-
-    #     # 3) velocity estimation
-    #     # est_vel = self.vel_head(z_p)
-    #     est_vel = self.compute_estimated_velocity(z_p)
-
-    #     # 8) final actor obs
-    #     actor_obs = torch.cat([est_vel, proprio_obs, z_p], dim=-1)
-
-    #     return actor_obs, proprio_hist
-    
-    # def act_in_update(self, vel_for_actor, obs, obs_hist, **kwargs):
-    #     z_pH, mu_p, logvar_p, pred_obs = self.forward_proprio_vae(obs_hist)
-    #     actor_obs = torch.cat([vel_for_actor, obs, mu_p], dim=-1)
-    #     self.update_distribution(actor_obs)
-    #     return self.distribution.sample(), mu_p, z_pH, pred_obs, logvar_p
-    # def act_in_update(self, vel_for_actor, obs, mu_p, **kwargs):
-    #     actor_obs = torch.cat([vel_for_actor, obs, mu_p], dim=-1)
-    #     self.update_distribution(actor_obs)
-    #     return self.distribution.sample()
-    # def act_in_update(self, obs, true_velocity_obs, p_boot: float = 0.0, **kwargs):
-    #     out = self.prepare_actor_obs(
-    #         actor_obs=obs,
-    #         true_velocity_obs=true_velocity_obs,
-    #         p_boot=p_boot,
-    #         inference=False,
-    #     )
-    #     self.update_distribution(out["actor_input"])
-    #     return out
     def act_in_update(
         self,
         obs,
@@ -486,13 +455,7 @@ class dwaq_policy(nn.Module):
         )
         self.update_distribution(out["actor_input"])
         return out
-    
-    # def act_for_onnx_transfer(self, obs, obs_hist, **kwargs):
-    #     z_p, mu_p, logvar_p, pred_obs = self.forward_proprio_vae(obs_hist)
-    #     est_vel = self.vel_head(mu_p) # use mean for velocity estimation during ONNX transfer
-    #     actor_obs = torch.cat([est_vel, obs, mu_p], dim=-1)
-        
-    #     return self.actor(actor_obs)
+
     def act_for_onnx_transfer(self, obs, obs_history, use_mu=True, **kwargs):
         """
         obs:         [B, obs_dim]
@@ -512,6 +475,42 @@ class dwaq_policy(nn.Module):
 
         est_v = self.compute_estimated_velocity(z_p)
         actor_obs = torch.cat([est_v, obs, z_p], dim=-1)
+        action = self.actor(actor_obs)
+
+        return action, est_v
+    
+    def act_for_onnx_transfer_with_external_vel(
+        self,
+        obs: torch.Tensor,
+        obs_history: torch.Tensor,
+        vel: torch.Tensor,
+        use_mu: bool = True,
+        **kwargs,
+    ):
+        """
+        obs:         [B, obs_dim]
+        obs_history: [B, H, obs_dim]
+        vel:         [B, vel_dim]  # 外部提供給 actor 使用
+
+        return:
+            action: [B, act_dim]
+            est_v:  [B, vel_dim]  # policy 自己估測的速度，只作為輸出監看
+        """
+
+        proprio_encoder_feat = self.proprio_encoder(obs_history)
+        mu_p = self.proprio_encoder_mu(proprio_encoder_feat)
+        logvar_p = self.proprio_encoder_logvar(proprio_encoder_feat)
+
+        if use_mu:
+            z_p = mu_p
+        else:
+            z_p, _ = self.reparameterize(mu_p, logvar_p)
+
+        # DWAQ 自己估測的速度，輸出給你 debug / compare
+        est_v = self.compute_estimated_velocity(z_p)
+
+        # 注意：actor 使用外部 vel，不使用 est_v
+        actor_obs = torch.cat([vel, obs, z_p], dim=-1)
         action = self.actor(actor_obs)
 
         return action, est_v

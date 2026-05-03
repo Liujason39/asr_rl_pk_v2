@@ -10,7 +10,7 @@ import torch
 import torch.nn as nn
 from torch.distributions import Normal
 
-from asr_rl_pk.networks import Memory, TemporalBuffer
+from asr_rl_pk.networks import Memory, TemporalBuffer, TemporalBuffer_v2
 from asr_rl_pk.utils import resolve_nn_activation
 
 from .MixerMLP import MixerMLP
@@ -39,7 +39,8 @@ class dwaqpp_policy(nn.Module):
         mixer_hidden_dims = [256, 256, 64],
         activation="elu",
         init_noise_std=1.0,
-        noise_std_type: str = "scalar",
+        noise_std_type: str = "log", #"scalar",
+        history_length=5,
         **kwargs,
     ):
         if kwargs:
@@ -50,11 +51,11 @@ class dwaqpp_policy(nn.Module):
         super().__init__()
         activation = resolve_nn_activation(activation)
 
-        H = 5 # history stacking length
-        self.history_len = H
-        self.proprio_hist_buffer = TemporalBuffer(H)   # 存 proprio + true_vel
-        self.zp_hist_buffer = TemporalBuffer(H)        # 存 z_p
-        self.ze_hist_buffer = TemporalBuffer(H)        # 存 z_e
+        self.history_len = history_length
+
+        self.proprio_hist_buffer = TemporalBuffer_v2(self.history_len)   # 存 proprio
+        self.proprio_hist_for_mixer_buffer = TemporalBuffer_v2(history_length)
+        self.visual_hist_for_mixer_buffer = TemporalBuffer_v2(history_length)
 
         # =====heighmap_encoder : process privileged observations to latent for critic=====
         layers = []
@@ -63,10 +64,13 @@ class dwaqpp_policy(nn.Module):
             layers.append(nn.Linear(in_dim, out_dim))
             if i != len(hm_hidden_dims) - 1:   # 最後一層不加 activation
                 layers.append(activation)
+            if i == len(hm_hidden_dims) - 1:
+                layers.append(nn.LayerNorm(hm_hidden_dims[i])) # 最後一層加 LayerNorm 為了在mixer跟其他encoder混和
             in_dim = out_dim
         self.hm_encoder = nn.Sequential(*layers)
 
         print(f"hm_encoder: {self.hm_encoder}")
+        
 
         # =====privileged_enocder : process privileged observations to latent for critic=====
         layers = []
@@ -75,6 +79,8 @@ class dwaqpp_policy(nn.Module):
             layers.append(nn.Linear(in_dim, out_dim))
             if i != len(privileged_hidden_dims) - 1:   # 最後一層不加 activation
                 layers.append(activation)
+            if i == len(privileged_hidden_dims) - 1:
+                layers.append(nn.LayerNorm(privileged_hidden_dims[i])) # 最後一層加 LayerNorm 為了在mixer跟其他encoder混和
             in_dim = out_dim
         self.privileged_encoder = nn.Sequential(*layers)
 
@@ -96,10 +102,10 @@ class dwaqpp_policy(nn.Module):
 
         # =====proprio_enocder : process prorpio observations to latent for Mixer=====
         layers = []
-        in_dim = (num_actor_obs+num_true_vel_obs) # set H_t = 5 for history stacking
+        in_dim = (num_actor_obs) # set H_t = 5 for history stacking
         self.proprio_encoder = MixerMLP(
             num_tokens=in_dim,
-            num_channels=H,
+            num_channels=history_length,
             hidden_dim=proprio_hidden_dims[0],
             num_layers=1,
             out_dim=proprio_hidden_dims[-1],
@@ -119,6 +125,8 @@ class dwaqpp_policy(nn.Module):
             layers.append(nn.Linear(in_dim, out_dim))
             if i != len(visual_hidden_dims) - 1:   # 最後一層不加 activation
                 layers.append(activation)
+            if i == len(visual_hidden_dims) - 1:
+                layers.append(nn.LayerNorm(visual_hidden_dims[i])) # 最後一層加 LayerNorm 為了在mixer跟其他encoder混和
             in_dim = out_dim
         self.visual_encoder = nn.Sequential(*layers)
 
@@ -140,11 +148,10 @@ class dwaqpp_policy(nn.Module):
 
         # =====model_mixer : process 2 latent vector to latent for Actor=====
         layers = []
-        H = 5 # history stacking length
         in_dim = proprio_hidden_dims[-1] + visual_hidden_dims[-1] # concat proprio enocder and visual latent as input
         self.model_mixer = MixerMLP(
             num_tokens=in_dim,
-            num_channels=H,
+            num_channels=history_length,
             hidden_dim=mixer_hidden_dims[0],
             num_layers=1,
             out_dim=mixer_hidden_dims[-1],
@@ -204,6 +211,7 @@ class dwaqpp_policy(nn.Module):
             self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
         elif self.noise_std_type == "log":
             self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+            print("Using log scale noise_std_type")
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
 
@@ -223,21 +231,12 @@ class dwaqpp_policy(nn.Module):
             for idx, module in enumerate(mod for mod in sequential if isinstance(mod, nn.Linear))
         ]
 
-    def kl_divergence_diag_gaussian(self, mu, logvar):
-        # q(z|x) = N(mu, diag(sigma^2))
-        # p(z)   = N(0, I)
-        kl = 0.5 * torch.sum(
-            torch.exp(logvar) + mu.pow(2) - 1.0 - logvar,
-            dim=-1
-        )
-        return kl.mean()
     
-    def forward_mixer_vae(self, proprio_latent_seq, visual_latent_seq):
+    def forward_mixer_vae(self, zpze_mix_hist):
         """
-        proprio_latent_seq: [B, H, Dp]
-        visual_latent_seq:  [B, H, Dv]
+        zpze_mix_hist: [B, H, z_p+z_e]
         """
-        mixer_input = torch.cat([proprio_latent_seq, visual_latent_seq], dim=-1)  # [B, H, Dp+Dv]
+        mixer_input = zpze_mix_hist  # [B, H, z_p+z_e]
 
         mixer_feat = self.model_mixer(mixer_input)   # [B, mixer_latent_dim]
 
@@ -250,10 +249,10 @@ class dwaqpp_policy(nn.Module):
     
     def forward_proprio_vae(self, proprio_obs_seq):
         """
-        proprio_obs_seq: [B, H, proprio_obs_dim+vel_obs_dim]
+        proprio_obs_seq: [B, H, proprio_obs_dim]
         """
 
-        proprio_encoder_feat = self.proprio_encoder(proprio_obs_seq)   # [B, mixer_latent_dim]
+        proprio_encoder_feat = self.proprio_encoder(proprio_obs_seq)   # [B, H, mixer_latent_dim]
 
         mu = self.proprio_encoder_mu(proprio_encoder_feat)
         logvar = self.proprio_encoder_logvar(proprio_encoder_feat)
@@ -261,20 +260,26 @@ class dwaqpp_policy(nn.Module):
 
         pred_obs = self.proprio_est_decoder(z_pH)
         return z_pH, mu, clamp_logvar, pred_obs
-
-    def reparameterize(self, mu, logvar, logvar_min=0.0, logvar_max=5):
-        # 對應論文 constrained reparameterization 的簡化實作
-        # sigma_max = 5 
+    
+    def reparameterize(self, mu, logvar, logvar_min=-10.0, logvar_max=1.609): # log(5) = 1.609
         clamp_logvar = torch.clamp(logvar, min=logvar_min, max=logvar_max)
         std = torch.exp(0.5 * clamp_logvar)
         eps = torch.randn_like(std)
         z = mu + eps * std
         return z, clamp_logvar
 
+    def compute_estimated_velocity(self, z_p):
+        vel_code = self.vel_head(z_p)
+        # vel_encoder_mu = self.vel_encoder_mu(vel_code)
+        # vel_encoder_logvar = self.vel_encoder_logvar(vel_code)
+        # z, clamp_logvar = self.reparameterize(vel_encoder_mu, vel_encoder_logvar)  # for KL loss computation, not used for action generation
+        # return z
+        return vel_code
+
     def reset(self, dones=None):
         self.proprio_hist_buffer.reset(dones)
-        self.zp_hist_buffer.reset(dones)
-        self.ze_hist_buffer.reset(dones)
+        self.proprio_hist_for_mixer_buffer.reset(dones)
+        self.visual_hist_for_mixer_buffer.reset(dones)
 
     def forward(self):
         raise NotImplementedError
@@ -294,11 +299,20 @@ class dwaqpp_policy(nn.Module):
     def update_distribution(self, observations):
         # compute mean
         mean = self.actor(observations)
+        if not torch.isfinite(mean).all():
+            raise RuntimeError("Actor mean became non-finite.")
         # compute standard deviation
         if self.noise_std_type == "scalar":
             std = self.std.expand_as(mean)
         elif self.noise_std_type == "log":
-            std = torch.exp(self.log_std).expand_as(mean)
+            # std = torch.exp(self.log_std).expand_as(mean)
+            log_std = torch.clamp(self.log_std, min=-5.0, max=2.0)
+            std = torch.exp(log_std).expand_as(mean)
+            if not torch.isfinite(std).all():
+                raise RuntimeError("Action std became non-finite.")
+            if (std <= 0).any():
+                raise RuntimeError("Action std became non-positive.")
+
         else:
             raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
         # create distribution
@@ -335,81 +349,351 @@ class dwaqpp_policy(nn.Module):
     def get_actions_log_prob(self, actions):
         return self.distribution.log_prob(actions).sum(dim=-1)
 
-    def act_inference(self, actor_obs):
-        """this will be cover by self.prepare_actor_obs()"""
-        return self.actor(actor_obs)
+    @torch.no_grad()
+    def act_inference(self, obs, visual_obs, return_aux=True):
+        """
+        Inference-time action generation using only current observation.
+        Internal history buffer will be updated automatically.
 
-    def evaluate(self, gt_hm, privileged_obs, **kwargs):
-        hm_latent = self.hm_encoder(gt_hm)
+        Args:
+            obs: Tensor of shape [B, num_actor_obs]
+            return_aux: whether to also return estimated auxiliary outputs
+
+        Returns:
+            action: Tensor of shape [B, num_actions]
+            optionally a dict containing est_vel / mu_p / obs_hist / actor_obs
+        """
+        out = self.prepare_actor_obs(
+            proprio_obs=obs,
+            true_velocity_obs=None,
+            visual_obs=visual_obs,
+            p_boot=1.0,
+            inference=True,
+        )
+
+        action = self.actor(out["actor_input"])
+
+        if return_aux:
+            return action, {
+                "est_vel": out["est_vel"],
+                "mu_p": out["mu_p"],
+                "z_p": out["z_p"],
+                "obs_history": out["obs_history"],
+            }
+        return action
+    
+    @torch.no_grad()
+    def act_inference_TrueVel(self, obs, true_velocity_obs, return_aux=True):
+        """
+        Inference-time action generation using only current observation.
+        Internal history buffer will be updated automatically.
+
+        Args:
+            obs: Tensor of shape [B, num_actor_obs]
+            true_velocity_obs: Tensor of shape [B, num_true_vel_obs]
+            return_aux: whether to also return estimated auxiliary outputs
+
+        Returns:
+            action: Tensor of shape [B, num_actions]
+            optionally a dict containing est_vel / mu_p / obs_hist / actor_obs
+        """
+        out = self.prepare_actor_obs(
+            proprio_obs=obs,
+            true_velocity_obs=true_velocity_obs,
+            visual_obs=None,
+            p_boot=0.0,
+            inference=False,
+        )
+
+        action = self.actor(out["actor_input"])
+
+        if return_aux:
+            return action, {
+                "est_vel": out["est_vel"],
+                "mu_p": out["mu_p"],
+                "z_p": out["z_p"],
+                "obs_history": out["obs_history"],
+            }
+        return action
+
+    def evaluate(self, privileged_obs, gt_hm, **kwargs):
         privileged_latent = self.privileged_encoder(privileged_obs)
+        hm_latent = self.hm_encoder(gt_hm)
         cat_latents = torch.cat([hm_latent, privileged_latent], dim=-1)
         value = self.critic(cat_latents)
-        return value, hm_latent, privileged_latent
+        return value
 
     def get_hidden_states(self):
         raise NotImplementedError
         # return self.memory_a.hidden_states, self.memory_c.hidden_states
 
-    def prepare_actor_obs(self, obs_dict, p_boot: float = 0.0, inference: bool = False):
+    def prepare_actor_obs(
+            self,
+            proprio_obs, # [B, num_actor_obs] 
+            true_velocity_obs=None,
+            visual_obs=None, # [B, visual_obs]
+            p_boot: float = 0.0,
+            inference: bool = False,
+            boot_mask: torch.Tensor | None = None,
+        ):
         """
-        obs_dict should provide:
-        - proprio_obs: [B, num_actor_obs]
-        - true_vel_obs: [B, num_true_vel_obs]
-        - visual_obs: [B, num_visual_obs]
+        obs_dict: [B, num_actor_obs] [B, visual_obs]
+        true_velocity_obs: [B, num_true_vel_obs]
+        p_boot: rollout 時用來抽樣 boot mask 的機率
+        inference: True 時永遠使用 estimated velocity
+        boot_mask: 若提供，直接使用此外部 mask，不再重新抽樣
         """
+    
+        # [B, 5, obs_dim]
+        proprio_hist = self.proprio_hist_buffer.append(proprio_obs)
 
-        proprio_obs = obs_dict["proprio_obs"]
-        true_vel_obs = obs_dict["true_vel_obs"]
-        visual_obs = obs_dict["visual_obs"]
+        # [B, 5, 5, obs_dim]
+        proprio_hist_for_mixer = self.proprio_hist_for_mixer_buffer.append(proprio_hist)
 
-        # 1) 更新 proprio history
-        proprio_step = torch.cat([proprio_obs, true_vel_obs], dim=-1)
-        proprio_hist = self.proprio_hist_buffer.append(proprio_step)
+        # [B, 5, visual_dim]
+        visual_hist_for_mixer = self.visual_hist_for_mixer_buffer.append(visual_obs)
 
-        # 2) proprio VAE
-        z_p, mu_p, logvar_p, pred_obs = self.forward_proprio_vae(proprio_hist)
+        out = self.build_actor_obs_from_history(
+            actor_obs=proprio_obs,
+            proprio_hist=proprio_hist,
+            proprio_hist_for_mixer=proprio_hist_for_mixer,
+            visual_hist_for_mixer=visual_hist_for_mixer,
+            true_velocity_obs=true_velocity_obs,
+            inference=inference,
+            boot_mask=boot_mask,
+            p_boot=p_boot,
+        )
 
-        # 3) velocity estimation
-        v_est = self.vel_head(z_p)
+        out["obs_history"] = proprio_hist
+        out["proprio_hist_for_mixer"] = proprio_hist_for_mixer
+        out["visual_hist_for_mixer"] = visual_hist_for_mixer
 
-        # 4) bootstrap mixing
+        return out
+
+        # # 2) VAE encoder
+        # z_p, mu_p, logvar_p, pred_next_obs = self.forward_proprio_vae(proprio_hist)
+
+        # # 3) velocity estimation
+        # est_vel = self.compute_estimated_velocity(z_p)
+
+        # # 4) bootstrapping
+        # if inference:
+        #     used_boot_mask = torch.ones_like(est_vel[:, :1])
+        #     vel_for_actor = est_vel
+        # else:
+        #     if true_velocity_obs is None:
+        #         raise ValueError("true_velocity_obs is required during training.")
+
+        #     if boot_mask is not None:
+        #         # 直接使用 rollout 時記錄下來的 mask
+        #         used_boot_mask = boot_mask.float()
+        #     else:
+        #         # rollout 階段才重新抽樣
+        #         B = true_velocity_obs.shape[0]
+        #         used_boot_mask = (
+        #             torch.rand(B, 1, device=true_velocity_obs.device) < p_boot
+        #         ).float()
+
+        #     vel_for_actor = used_boot_mask * est_vel + (1.0 - used_boot_mask) * true_velocity_obs
+
+        # # 5) visual latent
+        # z_e = self.visual_encoder(visual_obs)
+
+        # zpze_mix_hist = self.zpze_hist_buffer.append(torch.cat([z_p, z_e], dim=-1))
+
+        # # 6) multimodal mixer
+        # z_pe, mu_pe, logvar_pe, pred_hm = self.forward_mixer_vae(zpze_mix_hist)
+
+        # # 7) final actor obs
+        # actor_input = torch.cat([vel_for_actor, proprio_obs, z_pe], dim=-1)
+
+        # return {
+        #     "actor_input": actor_input,
+        #     "obs_history": proprio_hist,
+        #     "z_p": z_p,
+        #     "mu_p": mu_p,
+        #     "logvar_p": logvar_p,
+        #     "pred_next_obs": pred_next_obs,
+        #     "est_vel": est_vel,
+        #     "vel_for_actor": vel_for_actor,
+        #     "boot_mask": used_boot_mask,
+        #     "z_pe": z_pe,
+        #     "mu_pe": mu_pe,
+        #     "logvar_pe": logvar_pe,
+        #     "pred_hm": pred_hm,
+        #     "zpze_mix_hist": zpze_mix_hist,
+        # }
+
+    def build_actor_obs_from_history(
+        self,
+        actor_obs, # [B, num_actor_obs] [B, visual_obs]
+        proprio_hist,
+        proprio_hist_for_mixer,
+        visual_hist_for_mixer,
+        true_velocity_obs=None,
+        inference: bool = False,
+        boot_mask: torch.Tensor | None = None,
+        p_boot=0.0,
+    ):
+        # current z_p[t]
+        z_p, mu_p, logvar_p, pred_next_obs = self.forward_proprio_vae(proprio_hist)
+
+        est_vel = self.compute_estimated_velocity(z_p)
+
         if inference:
-            vel_for_actor = v_est
-            boot_mask = torch.ones_like(v_est[:, :1])
+            used_boot_mask = torch.ones_like(est_vel[:, :1])
+            vel_for_actor = est_vel
         else:
-            B = true_vel_obs.shape[0]
-            boot_mask = (torch.rand(B, 1, device=true_vel_obs.device) < p_boot).float()
-            vel_for_actor = boot_mask * v_est + (1.0 - boot_mask) * true_vel_obs
+            if boot_mask is None:
+                B = true_velocity_obs.shape[0]
+                used_boot_mask = (
+                    torch.rand(B, 1, device=true_velocity_obs.device) < p_boot
+                ).float()
+            else:
+                used_boot_mask = boot_mask.float()
+
+            vel_for_actor = used_boot_mask * est_vel + (1.0 - used_boot_mask) * true_velocity_obs
+
+        # proprio_hist_for_mixer: [B, 5, 5, obs_dim]
+        B, Hmix, Hprop, D = proprio_hist_for_mixer.shape
+
+        prop_flat = proprio_hist_for_mixer.reshape(B * Hmix, Hprop, D)
+        z_p_hist, _, _, _ = self.forward_proprio_vae(prop_flat)
+        z_p_hist = z_p_hist.reshape(B, Hmix, -1)
+
+        # visual_hist_for_mixer: [B, 5, visual_dim]
+        visual_flat = visual_hist_for_mixer.reshape(B * Hmix, -1)
+        z_e_hist = self.visual_encoder(visual_flat)
+        z_e_hist = z_e_hist.reshape(B, Hmix, -1)
+
+        zpze_mix_hist = torch.cat([z_p_hist, z_e_hist], dim=-1)
+
+        z_pe, mu_pe, logvar_pe, pred_hm = self.forward_mixer_vae(zpze_mix_hist)
+
+        actor_input = torch.cat([vel_for_actor, actor_obs, z_pe], dim=-1)
+
+        return {
+            "actor_input": actor_input,
+            "z_p": z_p,
+            "mu_p": mu_p,
+            "logvar_p": logvar_p,
+            "pred_next_obs": pred_next_obs,
+            "est_vel": est_vel,
+            "vel_for_actor": vel_for_actor,
+            "boot_mask": used_boot_mask,
+            "z_pe": z_pe,
+            "mu_pe": mu_pe,
+            "logvar_pe": logvar_pe,
+            "pred_hm": pred_hm,
+            "zpze_mix_hist": zpze_mix_hist,
+        }
+
+    def act_in_update(
+        self,
+        obs,
+        proprio_hist,
+        proprio_hist_for_mixer,
+        visual_hist_for_mixer,
+        true_velocity_obs,
+        boot_mask,
+        **kwargs,
+    ):
+        out = self.build_actor_obs_from_history(
+            actor_obs=obs,
+            proprio_hist=proprio_hist,
+            proprio_hist_for_mixer=proprio_hist_for_mixer,
+            visual_hist_for_mixer=visual_hist_for_mixer,
+            true_velocity_obs=true_velocity_obs,
+            inference=False,
+            boot_mask=boot_mask,
+        )
+
+        self.update_distribution(out["actor_input"])
+        return out
+
+    def act_for_onnx_transfer(self, 
+                              obs, 
+                              obs_history, 
+                              visual_obs, 
+                              zpze_mix_hist, 
+                              use_mu=True, **kwargs):
+        """
+        obs:         [B, obs_dim]
+        obs_history: [B, H, obs_dim]
+        visual_obs:  [B, visual_obs]
+        zpze_mix_hist: [B, H, z_p+z_e] 
+        return:
+            action: [B, act_dim]
+            est_v:  [B, vel_dim]
+            zpze_mix: [B, z_p+z_e] 
+        """
+        proprio_encoder_feat = self.proprio_encoder(obs_history)   # [B, latent_dim]
+        mu_p = self.proprio_encoder_mu(proprio_encoder_feat)
+        logvar_p = self.proprio_encoder_logvar(proprio_encoder_feat)
 
         # 5) visual latent
         z_e = self.visual_encoder(visual_obs)
 
-        # 6) latent histories
-        zp_hist = self.zp_hist_buffer.append(z_p)
-        ze_hist = self.ze_hist_buffer.append(z_e)
+        if use_mu:
+            z_p = mu_p
+        else:
+            z_p, _ = self.reparameterize(mu_p, logvar_p)
 
-        # 7) multimodal mixer
-        z_pe, mu_pe, logvar_pe, pred_hm = self.forward_mixer_vae(zp_hist, ze_hist)
+        zpze_mix = torch.cat([z_p, z_e], dim=-1)
 
-        # 8) final actor obs
-        actor_obs = torch.cat([proprio_obs, vel_for_actor, z_pe], dim=-1)
+        est_v = self.compute_estimated_velocity(z_p)
 
-        aux = {
-            "z_p": z_p,
-            "z_e": z_e,
-            "z_pe": z_pe,
-            "v_est": v_est,
-            "vel_for_actor": vel_for_actor,
-            "boot_mask": boot_mask,
-            "mu_p": mu_p,
-            "logvar_p": logvar_p,
-            "mu_pe": mu_pe,
-            "logvar_pe": logvar_pe,
-            "pred_obs": pred_obs,
-            "pred_hm": pred_hm,
-        }
-        return actor_obs, aux
-    
+        z_pe, mu_pe, clamp_logvar_pe, pred_hm = self.forward_mixer_vae(zpze_mix_hist)
+
+        actor_obs = torch.cat([est_v, obs, z_pe], dim=-1)
+        action = self.actor(actor_obs)
+
+        return action, est_v, zpze_mix
+
+    def act_for_onnx_transfer_with_external_vel(
+        self,
+        obs: torch.Tensor,
+        obs_history: torch.Tensor,
+        vel: torch.Tensor,
+        visual_obs, 
+        zpze_mix_hist, 
+        use_mu: bool = True,
+        **kwargs,
+    ):
+        """
+        obs:         [B, obs_dim]
+        obs_history: [B, H, obs_dim]
+        vel:         [B, vel_dim]
+        visual_obs:  [B, visual_obs]
+        zpze_mix_hist: [B, H, z_p+z_e] 
+        return:
+            action: [B, act_dim]
+            est_v:  [B, vel_dim]
+            zpze_mix: [B, z_p+z_e] 
+        """
+
+        proprio_encoder_feat = self.proprio_encoder(obs_history)   # [B, latent_dim]
+        mu_p = self.proprio_encoder_mu(proprio_encoder_feat)
+        logvar_p = self.proprio_encoder_logvar(proprio_encoder_feat)
+
+        # 5) visual latent
+        z_e = self.visual_encoder(visual_obs)
+
+        if use_mu:
+            z_p = mu_p
+        else:
+            z_p, _ = self.reparameterize(mu_p, logvar_p)
+
+        zpze_mix = torch.cat([z_p, z_e], dim=-1)
+
+        est_v = self.compute_estimated_velocity(z_p)
+
+        z_pe, mu_pe, clamp_logvar_pe, pred_hm = self.forward_mixer_vae(zpze_mix_hist)
+
+        actor_obs = torch.cat([vel, obs, z_pe], dim=-1)
+        action = self.actor(actor_obs)
+
+        return action, est_v, zpze_mix
     def load_state_dict(self, state_dict, strict=True):
         """Load the parameters of the actor-critic model.
 

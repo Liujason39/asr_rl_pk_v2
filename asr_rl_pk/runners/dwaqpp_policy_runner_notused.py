@@ -12,7 +12,7 @@ import torch
 from collections import deque
 
 import asr_rl_pk
-from asr_rl_pk.algorithms import PPO, Distillation
+from asr_rl_pk.algorithms import PPO, Distillation, PPO_DWAQ, PPO_DWAQPP
 from asr_rl_pk.env import VecEnv
 from asr_rl_pk.modules import (
     ActorCritic,

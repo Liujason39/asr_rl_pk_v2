@@ -12,7 +12,7 @@ import torch
 from collections import deque
 
 import asr_rl_pk
-from asr_rl_pk.algorithms import PPO, Distillation, PPO_DWAQ
+from asr_rl_pk.algorithms import PPO, Distillation, PPO_DWAQ, PPO_DWAQPP
 from asr_rl_pk.env import VecEnv
 from asr_rl_pk.modules import (
     ActorCritic,
@@ -24,7 +24,8 @@ from asr_rl_pk.modules import (
     VisualActorCritic,
     VisStudentTeacher,
     VisStudentTeacherRecurrent,
-    dwaq_policy
+    dwaq_policy,
+    dwaqpp_policy
 )
 from asr_rl_pk.utils import store_code_state
 
@@ -44,6 +45,8 @@ class DWAQPolicyRunner:
 
         # resolve training type depending on the algorithm
         if self.alg_cfg["class_name"] == "PPO_DWAQ":
+            self.training_type = "rl"
+        if self.alg_cfg["class_name"] == "PPO_DWAQPP":
             self.training_type = "rl"
         elif self.alg_cfg["class_name"] == "Distillation":
             self.training_type = "distillation"
@@ -163,10 +166,10 @@ class DWAQPolicyRunner:
         self.bootstrap_eps = 1e-6
 
     def _compute_p_boot_from_rewbuffer(self, rewbuffer):
-        if len(rewbuffer) < 2:
+        if len(rewbuffer) < 50:
             return 0.0
         R = torch.tensor(list(rewbuffer), dtype=torch.float32, device=self.device)
-        cv = R.std(unbiased=False) / (R.mean().abs() + self.bootstrap_eps)
+        cv = 4.0*R.std(unbiased=False) / (R.mean().abs() + self.bootstrap_eps)
         # Changed in version 2.0: Previously this argument was called unbiased 
         # and was a boolean with True corresponding to correction=1 and False being correction=0.
         p_boot = 1.0 - torch.tanh(cv)
@@ -307,7 +310,7 @@ class DWAQPolicyRunner:
                 for _ in range(self.num_steps_per_env):
 
                     # set the bootstrap probability for DWAQ
-                    # self.alg.set_bootstrap_prob(self.p_boot)
+                    self.alg.set_bootstrap_prob(self.p_boot)
                     
                     # Sample actions
                     actions = self.alg.act(
@@ -334,10 +337,10 @@ class DWAQPolicyRunner:
                     true_velocity_obs = infos["observations"][self.true_velocity_type].to(self.device)
 
                     # new_obs for DWAQ
-                    # next_obs = obs
+                    next_obs = obs
                     # process the step
-                    self.alg.process_env_step(rewards, dones, infos)
-                    # self.alg.process_env_step(next_obs, rewards, dones, infos)
+                    # self.alg.process_env_step(rewards, dones, infos)
+                    self.alg.process_env_step(next_obs, rewards, dones, infos)
 
                     # Extract intrinsic rewards (only for logging)
                     intrinsic_rewards = self.alg.intrinsic_rewards if self.alg.rnd else None
@@ -584,6 +587,17 @@ class DWAQPolicyRunner:
         if device is not None:
             self.alg.policy.to(device)
         policy = self.alg.policy.act_inference
+        if self.cfg["empirical_normalization"]:
+            if device is not None:
+                self.obs_normalizer.to(device)
+            policy = lambda x: self.alg.policy.act_inference(self.obs_normalizer(x))  # noqa: E731
+        return policy
+    
+    def get_inference_policy_TrueVel(self, device=None):
+        self.eval_mode()  # switch to evaluation mode (dropout for example)
+        if device is not None:
+            self.alg.policy.to(device)
+        policy = self.alg.policy.act_inference_TrueVel
         if self.cfg["empirical_normalization"]:
             if device is not None:
                 self.obs_normalizer.to(device)
