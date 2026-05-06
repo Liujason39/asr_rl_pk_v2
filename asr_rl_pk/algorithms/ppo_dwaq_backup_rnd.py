@@ -233,26 +233,15 @@ class PPO_DWAQ:
 
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
-            # # Obtain curiosity gates / observations from infos
-            # rnd_state = infos["observations"]["rnd_state"]
-            # # Compute the intrinsic rewards
-            # # note: rnd_state is the gated_state after normalization if normalization is used
-            # self.intrinsic_rewards, rnd_state = self.rnd.get_intrinsic_reward(rnd_state)
-            # # Add intrinsic rewards to extrinsic rewards
-            # self.transition.rewards += self.intrinsic_rewards
-            # # Record the curiosity gates
-            # self.transition.rnd_state = rnd_state.clone()
-            # ===v2===
             # Obtain curiosity gates / observations from infos
-            rnd_state_raw = infos["observations"]["rnd_state"]
-            # only update normalizer during rollout collection
-            if self.rnd.state_normalization:
-                self.rnd.state_normalizer.update(rnd_state_raw)
+            rnd_state = infos["observations"]["rnd_state"]
             # Compute the intrinsic rewards
-            self.intrinsic_rewards, rnd_state_norm = self.rnd.get_intrinsic_reward(rnd_state_raw)
-            # Record the curiosity gates
+            # note: rnd_state is the gated_state after normalization if normalization is used
+            self.intrinsic_rewards, rnd_state = self.rnd.get_intrinsic_reward(rnd_state)
+            # Add intrinsic rewards to extrinsic rewards
             self.transition.rewards += self.intrinsic_rewards
-            self.transition.rnd_state = rnd_state_norm.clone()
+            # Record the curiosity gates
+            self.transition.rnd_state = rnd_state.clone()
 
         # Bootstrapping on time outs
         if "time_outs" in infos:
@@ -651,14 +640,12 @@ class PPO_DWAQ:
 
             # Random Network Distillation loss
             if self.rnd:
-                # # predict the embedding and the target
-                # predicted_embedding = self.rnd.predictor(rnd_state_batch)
-                # target_embedding = self.rnd.target(rnd_state_batch).detach()
-                # # compute the loss as the mean squared error
-                # mseloss = torch.nn.MSELoss()
-                # rnd_loss = mseloss(predicted_embedding, target_embedding)
-                # ===v2===
-                rnd_loss = self.rnd.compute_loss(rnd_state_batch)
+                # predict the embedding and the target
+                predicted_embedding = self.rnd.predictor(rnd_state_batch)
+                target_embedding = self.rnd.target(rnd_state_batch).detach()
+                # compute the loss as the mean squared error
+                mseloss = torch.nn.MSELoss()
+                rnd_loss = mseloss(predicted_embedding, target_embedding)
 
             # Compute the gradients
             # -- For PPO

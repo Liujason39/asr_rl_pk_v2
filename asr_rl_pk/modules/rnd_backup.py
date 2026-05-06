@@ -109,29 +109,11 @@ class RandomNetworkDistillation(nn.Module):
         # make target network not trainable
         self.target.eval()
 
-    def get_normalized_rnd_state(self, rnd_state, update_stats: bool):
-        if self.state_normalization:
-            if update_stats:
-                self.state_normalizer.update(rnd_state)
-            rnd_state = self.state_normalizer(rnd_state)
-        return rnd_state
-
-
-    def compute_loss(self, rnd_state):
-        # 不要在這裡 update normalizer
-        with torch.no_grad():
-            rnd_state = self.get_normalized_rnd_state(rnd_state, update_stats=False)
-
-        predicted_embedding = self.predictor(rnd_state)
-        target_embedding = self.target(rnd_state).detach()
-        return torch.nn.functional.mse_loss(predicted_embedding, target_embedding)
-
     def get_intrinsic_reward(self, rnd_state) -> tuple[torch.Tensor, torch.Tensor]:
         # note: the counter is updated number of env steps per learning iteration
         self.update_counter += 1
         # Normalize rnd state
-        # rnd_state = self.state_normalizer(rnd_state)
-        rnd_state = self.get_normalized_rnd_state(rnd_state, update_stats=False)
+        rnd_state = self.state_normalizer(rnd_state)
         # Obtain the embedding of the rnd state from the target and predictor networks
         target_embedding = self.target(rnd_state).detach()
         predictor_embedding = self.predictor(rnd_state).detach()
