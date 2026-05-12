@@ -117,12 +117,14 @@ class PPO_DWAQ:
 
         # for bootstrapping in DWAQ
         self.bootstrap_prob = 0.0
-        self.loss_fn = nn.functional.mse_loss
+        self.mse_loss_fn = nn.functional.mse_loss
+        self.huber_loss_fn = nn.functional.huber_loss
+        
 
         self.p_boot = 0.0
 
-    # def set_bootstrap_prob(self, p_boot: float):
-    #     self.bootstrap_prob = float(max(0.0, min(1.0, p_boot)))
+    def set_bootstrap_prob(self, p_boot: float):
+        self.bootstrap_prob = float(max(0.0, min(1.0, p_boot)))
 
     def _repeat_on_batch_dim(self, x: torch.Tensor, num_aug: int, is_recurrent_batch: bool) -> torch.Tensor:
         """Repeat tensor along the batch dimension for symmetry augmentation.
@@ -184,10 +186,21 @@ class PPO_DWAQ:
         #     p_boot=self.bootstrap_prob,
         #     inference=False,
         # )
-        actor_obs, obs_history = self.policy.prepare_actor_obs(actor_obs=obs)
-        
+        """return_dict = {
+            "actor_input": actor_input,
+            "obs_history": proprio_hist,
+            "z_p": z_p,
+            "mu_p": mu_p,
+            "logvar_p": logvar_p,
+            "pred_next_obs": pred_next_obs,
+            "est_vel": est_vel,
+            "vel_for_actor": vel_for_actor,
+            "boot_mask": boot_mask,
+        }"""
+        return_dict = self.policy.prepare_actor_obs(actor_obs=obs, true_velocity_obs=true_velocity_obs, p_boot=self.bootstrap_prob, inference=False)
+
         # compute the actions and values
-        self.transition.actions = self.policy.act(actor_obs).detach()
+        self.transition.actions = self.policy.act(return_dict["actor_input"]).detach()
         # self.transition.values = self.policy.evaluate(critic_obs).detach()
         self.transition.values = self.policy.evaluate(critic_obs, gt_heightmap_obs).detach()
         self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
@@ -199,49 +212,47 @@ class PPO_DWAQ:
         # dwaq-specific transition data
         self.transition.gt_heightmap_obs = gt_heightmap_obs
         self.transition.true_velocity_obs = true_velocity_obs
-        self.transition.obs_history = obs_history.detach()
-        # self.transition.vel_for_actor = vel_for_actor.detach()
-        # self.transition.mu_p = mu_p.detach()
+        self.transition.obs_history = return_dict["obs_history"].detach()
+        self.transition.p_boot_mask = return_dict["boot_mask"].detach()
 
         return self.transition.actions
-    # def act(self, obs, critic_obs):
-        # # compute the actions and values
-        # self.transition.actions = self.policy.act(obs).detach()
-        # self.transition.values = self.policy.evaluate(critic_obs).detach()
-        # self.transition.actions_log_prob = self.policy.get_actions_log_prob(self.transition.actions).detach()
-        # self.transition.action_mean = self.policy.action_mean.detach()
-        # self.transition.action_sigma = self.policy.action_std.detach()
-        # # need to record obs and critic_obs before env.step()
-        # self.transition.observations = obs
-        # self.transition.privileged_observations = critic_obs
-        # return self.transition.actions
 
     
-    # def process_env_step(self, next_obs, rewards, dones, infos):
-    def process_env_step(self, rewards, dones, infos):
+    def process_env_step(self, next_obs, rewards, dones, infos):
+    # def process_env_step(self, rewards, dones, infos):
         # Record the rewards and dones
         # Note: we clone here because later on we bootstrap the rewards based on timeouts
-        cv = rewards.std() / (rewards.mean().abs() + 1e-6)
-        self.p_boot = 1.0 - torch.tanh(cv)
+        # cv = rewards.std() / (rewards.mean().abs() + 1e-6)
+        # self.p_boot = 1.0 - torch.tanh(cv)
         self.transition.rewards = rewards.clone()
         self.transition.dones = dones
 
         # store the next_obs for DWAQ
-        # self.transition.next_observations = next_obs.clone()
-        # self.transition.next_obs_valid = (~dones).float().unsqueeze(-1)
-        # self.transition.next_obs_valid = (1.0 - dones.float()).unsqueeze(-1)
+        self.transition.next_observations = next_obs.clone()
+        self.transition.next_obs_valid = (1.0 - dones.float()).unsqueeze(-1)
 
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
+            # # Obtain curiosity gates / observations from infos
+            # rnd_state = infos["observations"]["rnd_state"]
+            # # Compute the intrinsic rewards
+            # # note: rnd_state is the gated_state after normalization if normalization is used
+            # self.intrinsic_rewards, rnd_state = self.rnd.get_intrinsic_reward(rnd_state)
+            # # Add intrinsic rewards to extrinsic rewards
+            # self.transition.rewards += self.intrinsic_rewards
+            # # Record the curiosity gates
+            # self.transition.rnd_state = rnd_state.clone()
+            # ===v2===
             # Obtain curiosity gates / observations from infos
-            rnd_state = infos["observations"]["rnd_state"]
+            rnd_state_raw = infos["observations"]["rnd_state"]
+            # only update normalizer during rollout collection
+            if self.rnd.state_normalization:
+                self.rnd.state_normalizer.update(rnd_state_raw)
             # Compute the intrinsic rewards
-            # note: rnd_state is the gated_state after normalization if normalization is used
-            self.intrinsic_rewards, rnd_state = self.rnd.get_intrinsic_reward(rnd_state)
-            # Add intrinsic rewards to extrinsic rewards
-            self.transition.rewards += self.intrinsic_rewards
+            self.intrinsic_rewards, rnd_state_norm = self.rnd.get_intrinsic_reward(rnd_state_raw)
             # Record the curiosity gates
-            self.transition.rnd_state = rnd_state.clone()
+            self.transition.rewards += self.intrinsic_rewards
+            self.transition.rnd_state = rnd_state_norm.clone()
 
         # Bootstrapping on time outs
         if "time_outs" in infos:
@@ -297,8 +308,9 @@ class PPO_DWAQ:
             gt_heightmap_obs_batch,
             true_velocity_obs_batch,
             proprio_hist_batch,
-            # next_propprio_batch,
-            # next_obs_valid_batch,
+            next_propprio_batch,
+            next_obs_valid_batch,
+            p_boot_mask_batch,
             # vel_for_actor_batch,
             # mu_p_batch,
             actions_batch,
@@ -326,7 +338,6 @@ class PPO_DWAQ:
 
             # Perform symmetric augmentation
             if self.symmetry and self.symmetry["use_data_augmentation"]:
-                raise NotImplementedError("Symmetry augmentation for recurrent batch is not implemented yet.")
                 # augmentation using symmetry
                 data_augmentation_func = self.symmetry["data_augmentation_func"]
                 # 判斷是不是 recurrent batch
@@ -431,7 +442,22 @@ class PPO_DWAQ:
             #     print("B=", masks_batch.shape[1], "valid=", valid_traj.sum().item(), "invalid=", (~valid_traj).sum().item())
             # _, mu, z_pH, pred_obs, logvar_p = self.policy.act_in_update(vel_for_actor_batch, obs_batch, proprio_hist_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
             # self.policy.act_in_update(vel_for_actor_batch, obs_batch, mu_p_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
-            z_p, mu_p, logvar_p, pred_obs, est_vel = self.policy.act_in_update(obs_batch, proprio_hist_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
+            # z_p, mu_p, logvar_p, pred_obs, est_vel = self.policy.act_in_update(obs_batch, proprio_hist_batch, masks=masks_batch, hidden_states=hid_states_batch[0])
+            if not ((p_boot_mask_batch == 0) | (p_boot_mask_batch == 1)).all():
+                raise RuntimeError("p_boot_mask_batch contains non-binary values.")
+            out = self.policy.act_in_update(
+                obs=obs_batch,
+                proprio_hist=proprio_hist_batch,
+                true_velocity_obs=true_velocity_obs_batch,
+                boot_mask=p_boot_mask_batch,
+                masks=masks_batch,
+                hidden_states=hid_states_batch[0],
+            )
+
+            pred_obs = out["pred_next_obs"]
+            mu_p = out["mu_p"]
+            logvar_p = out["logvar_p"]
+            est_vel = out["est_vel"]
             # print("action_mean:", self.policy.action_mean.shape)
             # print("entropy:", self.policy.entropy.shape)
             # print("masks_batch:", None if masks_batch is None else masks_batch.shape)
@@ -510,15 +536,15 @@ class PPO_DWAQ:
             log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
             ratio = torch.exp(log_ratio)
 
-            # debug
-            print("actions_log_prob finite:", torch.isfinite(actions_log_prob_batch).all().item())
-            print("old_actions_log_prob finite:", torch.isfinite(old_actions_log_prob_batch).all().item())
-            print("actions_log_prob min/max:",
-                torch.nan_to_num(actions_log_prob_batch).min().item(),
-                torch.nan_to_num(actions_log_prob_batch).max().item())
-            print("old_actions_log_prob min/max:",
-                torch.nan_to_num(old_actions_log_prob_batch).min().item(),
-                torch.nan_to_num(old_actions_log_prob_batch).max().item())
+            # # debug
+            # print("actions_log_prob finite:", torch.isfinite(actions_log_prob_batch).all().item())
+            # print("old_actions_log_prob finite:", torch.isfinite(old_actions_log_prob_batch).all().item())
+            # print("actions_log_prob min/max:",
+            #     torch.nan_to_num(actions_log_prob_batch).min().item(),
+            #     torch.nan_to_num(actions_log_prob_batch).max().item())
+            # print("old_actions_log_prob min/max:",
+            #     torch.nan_to_num(old_actions_log_prob_batch).min().item(),
+            #     torch.nan_to_num(old_actions_log_prob_batch).max().item())
 
             surrogate = -torch.squeeze(advantages_batch) * ratio
             surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
@@ -544,17 +570,18 @@ class PPO_DWAQ:
             # D_KL_loss = self.policy.kl_divergence_diag_gaussian(mu, logvar_p)
 
             # est_vel_batch = self.policy.compute_estimated_velocity(z_pH)
-            est_vel_loss = self.loss_fn(est_vel, true_velocity_obs_batch).mean()
+            est_vel_loss = self.huber_loss_fn(est_vel, true_velocity_obs_batch).mean()
             
-            est_obs_loss = self.loss_fn(pred_obs, obs_batch).mean()
-            # valid = next_obs_valid_batch.squeeze(-1) > 0
-            # if valid.any():
-            #     est_obs_loss = self.loss_fn(pred_obs[valid], next_propprio_batch[valid])
-            # else:
-            #     est_obs_loss = 0.0 * pred_obs.sum()
+            # est_obs_loss = self.mse_loss_fn(pred_obs, obs_batch).mean()
+            valid = next_obs_valid_batch.squeeze(-1) > 0
+            if valid.any():
+                est_obs_loss = self.mse_loss_fn(pred_obs[valid], next_propprio_batch[valid]).mean()
+            else:
+                est_obs_loss = 0.0 * pred_obs.sum()
+
             D_kl_loss = (0.5 * (mu_p.pow(2) + logvar_p.exp() - logvar_p - 1)).sum(dim=-1).mean()
-            beta = 0.5
-            loss = loss + est_vel_loss + est_obs_loss + beta*D_kl_loss
+            
+            loss = loss + 5.0*est_vel_loss + 1.0*est_obs_loss + 0.05*D_kl_loss
 
             # for log
             mean_EstVel_loss += est_vel_loss.item()
@@ -623,28 +650,30 @@ class PPO_DWAQ:
 
             # Random Network Distillation loss
             if self.rnd:
-                # predict the embedding and the target
-                predicted_embedding = self.rnd.predictor(rnd_state_batch)
-                target_embedding = self.rnd.target(rnd_state_batch).detach()
-                # compute the loss as the mean squared error
-                mseloss = torch.nn.MSELoss()
-                rnd_loss = mseloss(predicted_embedding, target_embedding)
+                # # predict the embedding and the target
+                # predicted_embedding = self.rnd.predictor(rnd_state_batch)
+                # target_embedding = self.rnd.target(rnd_state_batch).detach()
+                # # compute the loss as the mean squared error
+                # mseloss = torch.nn.MSELoss()
+                # rnd_loss = mseloss(predicted_embedding, target_embedding)
+                # ===v2===
+                rnd_loss = self.rnd.compute_loss(rnd_state_batch)
 
             # Compute the gradients
             # -- For PPO
             self.optimizer.zero_grad()
             loss.backward()
-            if hasattr(self.policy, "log_std"):
-                print("log_std data min/max:",
-                    self.policy.log_std.data.min().item(),
-                    self.policy.log_std.data.max().item())
+            # if hasattr(self.policy, "log_std"):
+            #     print("log_std data min/max:",
+            #         self.policy.log_std.data.min().item(),
+            #         self.policy.log_std.data.max().item())
 
-                if self.policy.log_std.grad is not None:
-                    g = self.policy.log_std.grad
-                    print("log_std grad finite:", torch.isfinite(g).all().item())
-                    print("log_std grad min/max:",
-                        torch.nan_to_num(g).min().item(),
-                        torch.nan_to_num(g).max().item())
+            #     if self.policy.log_std.grad is not None:
+            #         g = self.policy.log_std.grad
+            #         print("log_std grad finite:", torch.isfinite(g).all().item())
+            #         print("log_std grad min/max:",
+            #             torch.nan_to_num(g).min().item(),
+            #             torch.nan_to_num(g).max().item())
             # -- For RND
             if self.rnd:
                 self.rnd_optimizer.zero_grad()  # type: ignore

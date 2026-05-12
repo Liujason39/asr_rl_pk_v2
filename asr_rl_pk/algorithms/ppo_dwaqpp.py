@@ -570,15 +570,15 @@ class PPO_DWAQPP:
             log_ratio = torch.clamp(log_ratio, min=-20.0, max=20.0)
             ratio = torch.exp(log_ratio)
 
-            # debug
-            print("actions_log_prob finite:", torch.isfinite(actions_log_prob_batch).all().item())
-            print("old_actions_log_prob finite:", torch.isfinite(old_actions_log_prob_batch).all().item())
-            print("actions_log_prob min/max:",
-                torch.nan_to_num(actions_log_prob_batch).min().item(),
-                torch.nan_to_num(actions_log_prob_batch).max().item())
-            print("old_actions_log_prob min/max:",
-                torch.nan_to_num(old_actions_log_prob_batch).min().item(),
-                torch.nan_to_num(old_actions_log_prob_batch).max().item())
+            # # debug
+            # print("actions_log_prob finite:", torch.isfinite(actions_log_prob_batch).all().item())
+            # print("old_actions_log_prob finite:", torch.isfinite(old_actions_log_prob_batch).all().item())
+            # print("actions_log_prob min/max:",
+            #     torch.nan_to_num(actions_log_prob_batch).min().item(),
+            #     torch.nan_to_num(actions_log_prob_batch).max().item())
+            # print("old_actions_log_prob min/max:",
+            #     torch.nan_to_num(old_actions_log_prob_batch).min().item(),
+            #     torch.nan_to_num(old_actions_log_prob_batch).max().item())
 
             surrogate = -torch.squeeze(advantages_batch) * ratio
             surrogate_clipped = -torch.squeeze(advantages_batch) * torch.clamp(
@@ -708,17 +708,17 @@ class PPO_DWAQPP:
             # -- For PPO
             self.optimizer.zero_grad()
             loss.backward()
-            if hasattr(self.policy, "log_std"):
-                print("log_std data min/max:",
-                    self.policy.log_std.data.min().item(),
-                    self.policy.log_std.data.max().item())
+            # if hasattr(self.policy, "log_std"):
+            #     print("log_std data min/max:",
+            #         self.policy.log_std.data.min().item(),
+            #         self.policy.log_std.data.max().item())
 
-                if self.policy.log_std.grad is not None:
-                    g = self.policy.log_std.grad
-                    print("log_std grad finite:", torch.isfinite(g).all().item())
-                    print("log_std grad min/max:",
-                        torch.nan_to_num(g).min().item(),
-                        torch.nan_to_num(g).max().item())
+            #     if self.policy.log_std.grad is not None:
+            #         g = self.policy.log_std.grad
+            #         print("log_std grad finite:", torch.isfinite(g).all().item())
+            #         print("log_std grad min/max:",
+            #             torch.nan_to_num(g).min().item(),
+            #             torch.nan_to_num(g).max().item())
             # -- For RND
             if self.rnd:
                 self.rnd_optimizer.zero_grad()  # type: ignore
