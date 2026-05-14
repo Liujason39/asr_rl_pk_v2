@@ -10,16 +10,16 @@ import torch.nn as nn
 import torch.optim as optim
 from itertools import chain
 
-from asr_rl_pk.modules import ActorCritic, dwaq_policy
+from asr_rl_pk.modules import ActorCritic, dwaq_policy, dwaqpp_policy
 from asr_rl_pk.modules.rnd import RandomNetworkDistillation
-from asr_rl_pk.storage import RolloutStorage, RolloutStorageDWAQ
+from asr_rl_pk.storage import RolloutStorage, RolloutStorageDWAQ, RolloutStorageDWAQPP
 from asr_rl_pk.utils import string_to_callable, unpad_trajectories
 
 
-class PPO_DWAQ:
+class PPO_DWAQPP:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: dwaq_policy
+    policy: dwaqpp_policy
     """The actor critic module."""
 
     def __init__(
@@ -97,8 +97,8 @@ class PPO_DWAQ:
         # Create optimizer
         self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
         # Create rollout storage
-        self.storage: RolloutStorageDWAQ = None  # type: ignore
-        self.transition = RolloutStorageDWAQ.Transition()
+        self.storage: RolloutStorageDWAQPP = None  # type: ignore
+        self.transition = RolloutStorageDWAQPP.Transition()
 
         # PPO parameters
         self.clip_param = clip_param
@@ -152,7 +152,17 @@ class PPO_DWAQ:
             raise RuntimeError(f"Recurrent unexpected tensor shape: {tuple(x.shape)}")
 
     def init_storage(
-        self, training_type, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, gt_heightmap_obs_shape, true_velocity_obs_shape, actions_shape, hist_length
+        self, 
+        training_type, 
+        num_envs, 
+        num_transitions_per_env, 
+        actor_obs_shape, 
+        critic_obs_shape, 
+        gt_heightmap_obs_shape, 
+        true_velocity_obs_shape, 
+        actions_shape, 
+        hist_length,
+        visual_obs_shape,
     ):
         # create memory for RND as well :)
         if self.rnd:
@@ -160,7 +170,7 @@ class PPO_DWAQ:
         else:
             rnd_state_shape = None
         # create rollout storage
-        self.storage = RolloutStorageDWAQ(
+        self.storage = RolloutStorageDWAQPP(
             training_type,
             num_envs,
             num_transitions_per_env,
@@ -170,12 +180,13 @@ class PPO_DWAQ:
             true_velocity_obs_shape,
             actions_shape,
             hist_length, # specifiable history length for DWAQ
+            visual_obs_shape,
             rnd_state_shape,
             self.device,
         )
 
     
-    def act(self, obs, critic_obs, true_velocity_obs, gt_heightmap_obs = None):
+    def act(self, obs, critic_obs, true_velocity_obs, gt_heightmap_obs, visual_obs):
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
 
@@ -197,7 +208,12 @@ class PPO_DWAQ:
             "vel_for_actor": vel_for_actor,
             "boot_mask": boot_mask,
         }"""
-        return_dict = self.policy.prepare_actor_obs(actor_obs=obs, true_velocity_obs=true_velocity_obs, p_boot=self.bootstrap_prob, inference=False)
+        return_dict = self.policy.prepare_actor_obs(
+            proprio_obs=obs, 
+            true_velocity_obs=true_velocity_obs, 
+            visual_obs=visual_obs, 
+            p_boot=self.bootstrap_prob, 
+            inference=False)
 
         # compute the actions and values
         self.transition.actions = self.policy.act(return_dict["actor_input"]).detach()
@@ -208,12 +224,16 @@ class PPO_DWAQ:
         self.transition.action_sigma = self.policy.action_std.detach()
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs # not actor_obs, it will be prepare again in update for gradient 
+        self.transition.visual_obs = visual_obs
         self.transition.privileged_observations = critic_obs
         # dwaq-specific transition data
         self.transition.gt_heightmap_obs = gt_heightmap_obs
         self.transition.true_velocity_obs = true_velocity_obs
-        self.transition.obs_history = return_dict["obs_history"].detach().clone()
+        self.transition.obs_history = return_dict["obs_history"].detach()
         self.transition.p_boot_mask = return_dict["boot_mask"].detach()
+        self.transition.proprio_hist_for_mixer = return_dict["proprio_hist_for_mixer"].detach()
+        self.transition.visual_hist_for_mixer = return_dict["visual_hist_for_mixer"].detach()
+        self.transition.visual_obs = visual_obs
 
         return self.transition.actions
 
@@ -233,26 +253,15 @@ class PPO_DWAQ:
 
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
-            # # Obtain curiosity gates / observations from infos
-            # rnd_state = infos["observations"]["rnd_state"]
-            # # Compute the intrinsic rewards
-            # # note: rnd_state is the gated_state after normalization if normalization is used
-            # self.intrinsic_rewards, rnd_state = self.rnd.get_intrinsic_reward(rnd_state)
-            # # Add intrinsic rewards to extrinsic rewards
-            # self.transition.rewards += self.intrinsic_rewards
-            # # Record the curiosity gates
-            # self.transition.rnd_state = rnd_state.clone()
-            # ===v2===
             # Obtain curiosity gates / observations from infos
-            rnd_state_raw = infos["observations"]["rnd_state"]
-            # only update normalizer during rollout collection
-            if self.rnd.state_normalization:
-                self.rnd.state_normalizer.update(rnd_state_raw)
+            rnd_state = infos["observations"]["rnd_state"]
             # Compute the intrinsic rewards
-            self.intrinsic_rewards, rnd_state_norm = self.rnd.get_intrinsic_reward(rnd_state_raw)
-            # Record the curiosity gates
+            # note: rnd_state is the gated_state after normalization if normalization is used
+            self.intrinsic_rewards, rnd_state = self.rnd.get_intrinsic_reward(rnd_state)
+            # Add intrinsic rewards to extrinsic rewards
             self.transition.rewards += self.intrinsic_rewards
-            self.transition.rnd_state = rnd_state_norm.clone()
+            # Record the curiosity gates
+            self.transition.rnd_state = rnd_state.clone()
 
         # Bootstrapping on time outs
         if "time_outs" in infos:
@@ -280,6 +289,8 @@ class PPO_DWAQ:
         mean_EstVel_loss=0
         mean_D_KL_loss=0
         mean_EstObs_loss=0
+        mean_HM_loss = 0
+        mean_PE_KL_loss = 0
 
         # -- RND loss
         if self.rnd:
@@ -311,6 +322,9 @@ class PPO_DWAQ:
             next_propprio_batch,
             next_obs_valid_batch,
             p_boot_mask_batch,
+            visual_obs_batch,
+            proprio_hist_for_mixer_batch,
+            visual_hist_for_mixer_batch,
             # vel_for_actor_batch,
             # mu_p_batch,
             actions_batch,
@@ -338,6 +352,7 @@ class PPO_DWAQ:
 
             # Perform symmetric augmentation
             if self.symmetry and self.symmetry["use_data_augmentation"]:
+                raise NotImplementedError("Symmetry augmentation for recurrent batch is not implemented yet.")
                 # augmentation using symmetry
                 data_augmentation_func = self.symmetry["data_augmentation_func"]
                 # 判斷是不是 recurrent batch
@@ -426,30 +441,12 @@ class PPO_DWAQ:
                         obs=critic_obs_batch, actions=None, env=self.symmetry["_env"], obs_type="critic"
                     )
 
-                    # amended for dwaq auxiliary inputs
-                    true_velocity_obs_batch, _ = data_augmentation_func(
-                        obs=true_velocity_obs_batch, actions=None, env=self.symmetry["_env"], obs_type="aux_true_vel"
-                    )
-                    proprio_hist_batch, _ = data_augmentation_func(
-                        obs=proprio_hist_batch, actions=None, env=self.symmetry["_env"], obs_type="aux_proprio_hist"
-                    )
-                    next_propprio_batch, _ = data_augmentation_func(
-                        obs=next_propprio_batch, actions=None, env=self.symmetry["_env"], obs_type="aux_next_proprio"
-                    )
-                    gt_heightmap_obs_batch, _ = data_augmentation_func(
-                        obs=gt_heightmap_obs_batch, actions=None, env=self.symmetry["_env"], obs_type="aux_heightmap",
-                    )
-
                     num_aug = int(obs_batch.shape[0] / original_batch_size)
 
                     old_actions_log_prob_batch = self._repeat_on_batch_dim(old_actions_log_prob_batch, num_aug, False)
                     target_values_batch       = self._repeat_on_batch_dim(target_values_batch,       num_aug, False)
                     advantages_batch          = self._repeat_on_batch_dim(advantages_batch,          num_aug, False)
                     returns_batch             = self._repeat_on_batch_dim(returns_batch,             num_aug, False)
-
-                    # DWAQ auxiliary inputs
-                    next_obs_valid_batch    = self._repeat_on_batch_dim(next_obs_valid_batch, num_aug, False)
-                    p_boot_mask_batch          = self._repeat_on_batch_dim(p_boot_mask_batch, num_aug, False)
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: we need to do this because we updated the policy with the new parameters
             # -- actor
@@ -466,16 +463,35 @@ class PPO_DWAQ:
             out = self.policy.act_in_update(
                 obs=obs_batch,
                 proprio_hist=proprio_hist_batch,
+                proprio_hist_for_mixer=proprio_hist_for_mixer_batch,
+                visual_hist_for_mixer=visual_hist_for_mixer_batch,
                 true_velocity_obs=true_velocity_obs_batch,
                 boot_mask=p_boot_mask_batch,
-                masks=masks_batch,
-                hidden_states=hid_states_batch[0],
             )
-
+            """
+            out = {
+                "actor_input": actor_input,
+                "z_p": z_p,
+                "mu_p": mu_p,
+                "logvar_p": logvar_p,
+                "pred_next_obs": pred_next_obs,
+                "est_vel": est_vel,
+                "vel_for_actor": vel_for_actor,
+                "boot_mask": used_boot_mask,
+                "z_pe": z_pe,
+                "mu_pe": mu_pe,
+                "logvar_pe": logvar_pe,
+                "pred_hm": pred_hm,
+                "zpze_mix_hist": zpze_mix_hist,
+            }
+            """
             pred_obs = out["pred_next_obs"]
             mu_p = out["mu_p"]
             logvar_p = out["logvar_p"]
             est_vel = out["est_vel"]
+            pred_hm = out["pred_hm"]
+            mu_pe = out["mu_pe"]
+            logvar_pe = out["logvar_pe"]
             # print("action_mean:", self.policy.action_mean.shape)
             # print("entropy:", self.policy.entropy.shape)
             # print("masks_batch:", None if masks_batch is None else masks_batch.shape)
@@ -598,84 +614,95 @@ class PPO_DWAQ:
                 est_obs_loss = 0.0 * pred_obs.sum()
 
             D_kl_loss = (0.5 * (mu_p.pow(2) + logvar_p.exp() - logvar_p - 1)).sum(dim=-1).mean()
+
+            hm_loss = self.mse_loss_fn(pred_hm, gt_heightmap_obs_batch).mean()
+
+            pe_kl_loss = (0.5 * (mu_pe.pow(2) + logvar_pe.exp() - logvar_pe - 1)).sum(dim=-1).mean()
             
-            loss = loss + 5.0*est_vel_loss + 1.0*est_obs_loss + 0.05*D_kl_loss
+            loss = (
+                loss
+                + 5.0 * est_vel_loss
+                + 1.0 * est_obs_loss
+                + 0.05 * D_kl_loss
+                + 1.0 * hm_loss
+                + 0.005 * pe_kl_loss
+            )
 
             # for log
             mean_EstVel_loss += est_vel_loss.item()
             mean_D_KL_loss += D_kl_loss.item()
             mean_EstObs_loss += est_obs_loss.item()
+            mean_HM_loss += hm_loss.item()
+            mean_PE_KL_loss += pe_kl_loss.item()
 
             # Symmetry loss
             if self.symmetry:
-                # obtain the symmetric actions
-                if not self.symmetry["use_data_augmentation"]:
-                    data_augmentation_func = self.symmetry["data_augmentation_func"]
-                    obs_batch, _ = data_augmentation_func(
-                        obs=obs_batch, actions=None, env=self.symmetry["_env"], obs_type="policy"
-                    )
-                    # compute number of augmentations per sample (MLP 假設 batch 在 dim=0)
-                    num_aug = int(obs_batch.shape[0] / original_batch_size)
+                raise NotImplementedError("Symmetry loss is not implemented yet.")
+                # # obtain the symmetric actions
+                # if not self.symmetry["use_data_augmentation"]:
+                #     data_augmentation_func = self.symmetry["data_augmentation_func"]
+                #     obs_batch, _ = data_augmentation_func(
+                #         obs=obs_batch, actions=None, env=self.symmetry["_env"], obs_type="policy"
+                #     )
+                #     # compute number of augmentations per sample (MLP 假設 batch 在 dim=0)
+                #     num_aug = int(obs_batch.shape[0] / original_batch_size)
 
-                data_augmentation_func = self.symmetry["data_augmentation_func"]
-                mse_loss = torch.nn.MSELoss()
+                # data_augmentation_func = self.symmetry["data_augmentation_func"]
+                # mse_loss = torch.nn.MSELoss()
 
-                if self.policy.is_recurrent:
-                    # -------------------------
-                    # RNN case: obs_batch is (T, B_aug, D)
-                    # -------------------------
-                    # 用 batch-mode 跑序列
-                    # 直接用，不要再 forward
-                    mean_actions_batch = self.policy.action_mean.detach()  # (T, B_aug, A)
+                # if self.policy.is_recurrent:
+                #     # -------------------------
+                #     # RNN case: obs_batch is (T, B_aug, D)
+                #     # -------------------------
+                #     # 用 batch-mode 跑序列
+                #     # 直接用，不要再 forward
+                #     mean_actions_batch = self.policy.action_mean.detach()  # (T, B_aug, A)
 
-                    # 原始 batch 大小 B0（第一份 augmentation）
-                    B_aug = mean_actions_batch.shape[1]
-                    B0 = B_aug // num_aug
+                #     # 原始 batch 大小 B0（第一份 augmentation）
+                #     B_aug = mean_actions_batch.shape[1]
+                #     B0 = B_aug // num_aug
 
-                    action_mean_orig = mean_actions_batch[:, :B0, :]  # (T, B0, A)
+                #     action_mean_orig = mean_actions_batch[:, :B0, :]  # (T, B0, A)
 
-                    # 對 action 做同樣 augmentation（actions-only call）
-                    _, actions_mean_symm_batch = data_augmentation_func(
-                        obs=None, actions=action_mean_orig, env=self.symmetry["_env"], obs_type="policy"
-                    )
-                    # actions_mean_symm_batch 期望是 (T, B_aug, A)，且第二份是 mirror(orig)
-                    symmetry_loss = mse_loss(
-                        mean_actions_batch[:, B0:, :],              # policy 在 mirrored obs 上的 mean action
-                        actions_mean_symm_batch.detach()[:, B0:, :] # mirror(orig_mean_action)
-                    )
+                #     # 對 action 做同樣 augmentation（actions-only call）
+                #     _, actions_mean_symm_batch = data_augmentation_func(
+                #         obs=None, actions=action_mean_orig, env=self.symmetry["_env"], obs_type="policy"
+                #     )
+                #     # actions_mean_symm_batch 期望是 (T, B_aug, A)，且第二份是 mirror(orig)
+                #     symmetry_loss = mse_loss(
+                #         mean_actions_batch[:, B0:, :],              # policy 在 mirrored obs 上的 mean action
+                #         actions_mean_symm_batch.detach()[:, B0:, :] # mirror(orig_mean_action)
+                #     )
 
-                else:
-                    # -------------------------
-                    # MLP case: obs_batch is (B_aug, D)
-                    # -------------------------
-                    mean_actions_batch = self.policy.action_mean.detach()  # ( B_aug, A)
-                    
-                    action_mean_orig = mean_actions_batch[:original_batch_size]
-                    _, actions_mean_symm_batch = data_augmentation_func(
-                        obs=None, actions=action_mean_orig, env=self.symmetry["_env"], obs_type="policy"
-                    )
-                    symmetry_loss = mse_loss(
-                        mean_actions_batch[original_batch_size:],
-                        actions_mean_symm_batch.detach()[original_batch_size:],
-                    )
+                # else:
+                #     # -------------------------
+                #     # MLP case: obs_batch is (B_aug, D)
+                #     # -------------------------
+                #     mean_actions_batch = self.policy.act_inference(obs_batch.detach().clone())
+                #     action_mean_orig = mean_actions_batch[:original_batch_size]
+                #     _, actions_mean_symm_batch = data_augmentation_func(
+                #         obs=None, actions=action_mean_orig, env=self.symmetry["_env"], obs_type="policy"
+                #     )
+                #     symmetry_loss = mse_loss(
+                #         mean_actions_batch[original_batch_size:],
+                #         actions_mean_symm_batch.detach()[original_batch_size:],
+                #     )
 
-                # add the loss to the total loss
-                if self.symmetry["use_mirror_loss"]:
-                    loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
-                else:
-                    symmetry_loss = symmetry_loss.detach()
+                # # add the loss to the total loss
+                # if self.symmetry["use_mirror_loss"]:
+                #     loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
+                # else:
+                #     symmetry_loss = symmetry_loss.detach()
 
 
             # Random Network Distillation loss
             if self.rnd:
-                # # predict the embedding and the target
-                # predicted_embedding = self.rnd.predictor(rnd_state_batch)
-                # target_embedding = self.rnd.target(rnd_state_batch).detach()
-                # # compute the loss as the mean squared error
-                # mseloss = torch.nn.MSELoss()
-                # rnd_loss = mseloss(predicted_embedding, target_embedding)
-                # ===v2===
-                rnd_loss = self.rnd.compute_loss(rnd_state_batch)
+                # predict the embedding and the target
+                predicted_embedding = self.rnd.predictor(rnd_state_batch)
+                target_embedding = self.rnd.target(rnd_state_batch).detach()
+                # compute the loss as the mean squared error
+                mseloss = torch.nn.MSELoss()
+                rnd_loss = mseloss(predicted_embedding, target_embedding)
 
             # Compute the gradients
             # -- For PPO
@@ -722,7 +749,8 @@ class PPO_DWAQ:
                 mean_rnd_loss += rnd_loss.item()
             # -- Symmetry loss
             if mean_symmetry_loss is not None:
-                mean_symmetry_loss += symmetry_loss.item()
+                raise NotImplementedError("Symmetry loss is not implemented yet.")
+                # mean_symmetry_loss += symmetry_loss.item()
 
         # -- For PPO
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -741,6 +769,8 @@ class PPO_DWAQ:
         mean_EstVel_loss /= num_updates
         mean_D_KL_loss /= num_updates
         mean_EstObs_loss /= num_updates
+        mean_HM_loss /= num_updates
+        mean_PE_KL_loss /= num_updates
 
         # construct the loss dictionary
         loss_dict = {
@@ -750,6 +780,8 @@ class PPO_DWAQ:
             "est_vel": mean_EstVel_loss,
             "D_KL": mean_D_KL_loss,
             "est_obs": mean_EstObs_loss,
+            "hm": mean_HM_loss,
+            "pe_kl": mean_PE_KL_loss,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss

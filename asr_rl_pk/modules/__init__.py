@@ -28,6 +28,7 @@ from .MonolithicPolicy_P3_0 import monolithicpolicy_p3_0
 
 from .DWAQ_Policy import dwaq_policy
 from .DWAQPP_Policy import dwaqpp_policy
+from .DWAQAE_Policy import dwaqae_policy
 
 __all__ = [
     "ActorCritic",
@@ -47,5 +48,6 @@ __all__ = [
     "monolithicpolicy_p3",
     "monolithicpolicy_p3_0",
     "dwaq_policy",
-    "dwaqpp_policy"
+    "dwaqpp_policy",
+    "dwaqae_policy"
 ]

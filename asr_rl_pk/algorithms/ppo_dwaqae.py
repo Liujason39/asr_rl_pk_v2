@@ -10,16 +10,16 @@ import torch.nn as nn
 import torch.optim as optim
 from itertools import chain
 
-from asr_rl_pk.modules import ActorCritic, dwaq_policy
+from asr_rl_pk.modules import ActorCritic, dwaq_policy, dwaqpp_policy, dwaqae_policy
 from asr_rl_pk.modules.rnd import RandomNetworkDistillation
-from asr_rl_pk.storage import RolloutStorage, RolloutStorageDWAQ
+from asr_rl_pk.storage import RolloutStorage, RolloutStorageDWAQ, RolloutStorageDWAQPP, RolloutStorageDWAQAE
 from asr_rl_pk.utils import string_to_callable, unpad_trajectories
 
 
-class PPO_DWAQ:
+class PPO_DWAQAE:
     """Proximal Policy Optimization algorithm (https://arxiv.org/abs/1707.06347)."""
 
-    policy: dwaq_policy
+    policy: dwaqae_policy
     """The actor critic module."""
 
     def __init__(
@@ -97,8 +97,8 @@ class PPO_DWAQ:
         # Create optimizer
         self.optimizer = optim.Adam(self.policy.parameters(), lr=learning_rate)
         # Create rollout storage
-        self.storage: RolloutStorageDWAQ = None  # type: ignore
-        self.transition = RolloutStorageDWAQ.Transition()
+        self.storage: RolloutStorageDWAQAE = None  # type: ignore
+        self.transition = RolloutStorageDWAQAE.Transition()
 
         # PPO parameters
         self.clip_param = clip_param
@@ -152,7 +152,17 @@ class PPO_DWAQ:
             raise RuntimeError(f"Recurrent unexpected tensor shape: {tuple(x.shape)}")
 
     def init_storage(
-        self, training_type, num_envs, num_transitions_per_env, actor_obs_shape, critic_obs_shape, gt_heightmap_obs_shape, true_velocity_obs_shape, actions_shape, hist_length
+        self, 
+        training_type, 
+        num_envs, 
+        num_transitions_per_env, 
+        actor_obs_shape, 
+        critic_obs_shape, 
+        gt_heightmap_obs_shape, 
+        true_velocity_obs_shape, 
+        actions_shape, 
+        hist_length,
+        visual_obs_shape,
     ):
         # create memory for RND as well :)
         if self.rnd:
@@ -160,7 +170,7 @@ class PPO_DWAQ:
         else:
             rnd_state_shape = None
         # create rollout storage
-        self.storage = RolloutStorageDWAQ(
+        self.storage = RolloutStorageDWAQAE(
             training_type,
             num_envs,
             num_transitions_per_env,
@@ -170,12 +180,13 @@ class PPO_DWAQ:
             true_velocity_obs_shape,
             actions_shape,
             hist_length, # specifiable history length for DWAQ
+            visual_obs_shape,
             rnd_state_shape,
             self.device,
         )
 
     
-    def act(self, obs, critic_obs, true_velocity_obs, gt_heightmap_obs = None):
+    def act(self, obs, critic_obs, true_velocity_obs, gt_heightmap_obs, visual_obs):
         if self.policy.is_recurrent:
             self.transition.hidden_states = self.policy.get_hidden_states()
 
@@ -197,7 +208,12 @@ class PPO_DWAQ:
             "vel_for_actor": vel_for_actor,
             "boot_mask": boot_mask,
         }"""
-        return_dict = self.policy.prepare_actor_obs(actor_obs=obs, true_velocity_obs=true_velocity_obs, p_boot=self.bootstrap_prob, inference=False)
+        return_dict = self.policy.prepare_actor_obs(
+            proprio_obs=obs, 
+            true_velocity_obs=true_velocity_obs, 
+            visual_obs=visual_obs, 
+            p_boot=self.bootstrap_prob, 
+            inference=False)
 
         # compute the actions and values
         self.transition.actions = self.policy.act(return_dict["actor_input"]).detach()
@@ -208,6 +224,7 @@ class PPO_DWAQ:
         self.transition.action_sigma = self.policy.action_std.detach()
         # need to record obs and critic_obs before env.step()
         self.transition.observations = obs # not actor_obs, it will be prepare again in update for gradient 
+        self.transition.visual_obs = visual_obs
         self.transition.privileged_observations = critic_obs
         # dwaq-specific transition data
         self.transition.gt_heightmap_obs = gt_heightmap_obs
@@ -233,16 +250,6 @@ class PPO_DWAQ:
 
         # Compute the intrinsic rewards and add to extrinsic rewards
         if self.rnd:
-            # # Obtain curiosity gates / observations from infos
-            # rnd_state = infos["observations"]["rnd_state"]
-            # # Compute the intrinsic rewards
-            # # note: rnd_state is the gated_state after normalization if normalization is used
-            # self.intrinsic_rewards, rnd_state = self.rnd.get_intrinsic_reward(rnd_state)
-            # # Add intrinsic rewards to extrinsic rewards
-            # self.transition.rewards += self.intrinsic_rewards
-            # # Record the curiosity gates
-            # self.transition.rnd_state = rnd_state.clone()
-            # ===v2===
             # Obtain curiosity gates / observations from infos
             rnd_state_raw = infos["observations"]["rnd_state"]
             # only update normalizer during rollout collection
@@ -280,6 +287,7 @@ class PPO_DWAQ:
         mean_EstVel_loss=0
         mean_D_KL_loss=0
         mean_EstObs_loss=0
+        mean_HM_loss = 0
 
         # -- RND loss
         if self.rnd:
@@ -311,6 +319,7 @@ class PPO_DWAQ:
             next_propprio_batch,
             next_obs_valid_batch,
             p_boot_mask_batch,
+            visual_obs_batch,
             # vel_for_actor_batch,
             # mu_p_batch,
             actions_batch,
@@ -439,6 +448,12 @@ class PPO_DWAQ:
                     gt_heightmap_obs_batch, _ = data_augmentation_func(
                         obs=gt_heightmap_obs_batch, actions=None, env=self.symmetry["_env"], obs_type="aux_heightmap",
                     )
+                    visual_obs_batch, _ = data_augmentation_func(
+                        obs=visual_obs_batch,
+                        actions=None,
+                        env=self.symmetry["_env"],
+                        obs_type="aux_heightmap", # we treat visual obs as heightmap for augmentation
+                    )
 
                     num_aug = int(obs_batch.shape[0] / original_batch_size)
 
@@ -466,16 +481,30 @@ class PPO_DWAQ:
             out = self.policy.act_in_update(
                 obs=obs_batch,
                 proprio_hist=proprio_hist_batch,
+                visual_obs=visual_obs_batch,
                 true_velocity_obs=true_velocity_obs_batch,
                 boot_mask=p_boot_mask_batch,
-                masks=masks_batch,
-                hidden_states=hid_states_batch[0],
             )
-
+            """
+            return {
+                "actor_input": actor_input,
+                "z_p": z_p,
+                "mu_p": mu_p,
+                "logvar_p": logvar_p,
+                "pred_next_obs": pred_next_obs,
+                "est_vel": est_vel,
+                "vel_for_actor": vel_for_actor,
+                "boot_mask": used_boot_mask,
+                "z_e": z_e,
+                "pred_hm": pred_hm,
+            }
+            """
             pred_obs = out["pred_next_obs"]
             mu_p = out["mu_p"]
             logvar_p = out["logvar_p"]
             est_vel = out["est_vel"]
+            pred_hm = out["pred_hm"]
+            z_e = out["z_e"]
             # print("action_mean:", self.policy.action_mean.shape)
             # print("entropy:", self.policy.entropy.shape)
             # print("masks_batch:", None if masks_batch is None else masks_batch.shape)
@@ -598,13 +627,22 @@ class PPO_DWAQ:
                 est_obs_loss = 0.0 * pred_obs.sum()
 
             D_kl_loss = (0.5 * (mu_p.pow(2) + logvar_p.exp() - logvar_p - 1)).sum(dim=-1).mean()
-            
-            loss = loss + 5.0*est_vel_loss + 1.0*est_obs_loss + 0.05*D_kl_loss
+
+            hm_loss = self.mse_loss_fn(pred_hm, gt_heightmap_obs_batch).mean()
+
+            loss = (
+                loss
+                + 5.0 * est_vel_loss
+                + 1.0 * est_obs_loss
+                + 0.05 * D_kl_loss
+                + 1.0 * hm_loss
+            )
 
             # for log
             mean_EstVel_loss += est_vel_loss.item()
             mean_D_KL_loss += D_kl_loss.item()
             mean_EstObs_loss += est_obs_loss.item()
+            mean_HM_loss += hm_loss.item()
 
             # Symmetry loss
             if self.symmetry:
@@ -741,6 +779,7 @@ class PPO_DWAQ:
         mean_EstVel_loss /= num_updates
         mean_D_KL_loss /= num_updates
         mean_EstObs_loss /= num_updates
+        mean_HM_loss /= num_updates
 
         # construct the loss dictionary
         loss_dict = {
@@ -750,6 +789,7 @@ class PPO_DWAQ:
             "est_vel": mean_EstVel_loss,
             "D_KL": mean_D_KL_loss,
             "est_obs": mean_EstObs_loss,
+            "hm": mean_HM_loss,
         }
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss

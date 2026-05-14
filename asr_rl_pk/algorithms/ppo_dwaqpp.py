@@ -352,7 +352,6 @@ class PPO_DWAQPP:
 
             # Perform symmetric augmentation
             if self.symmetry and self.symmetry["use_data_augmentation"]:
-                raise NotImplementedError("Symmetry augmentation for recurrent batch is not implemented yet.")
                 # augmentation using symmetry
                 data_augmentation_func = self.symmetry["data_augmentation_func"]
                 # 判斷是不是 recurrent batch
@@ -441,12 +440,30 @@ class PPO_DWAQPP:
                         obs=critic_obs_batch, actions=None, env=self.symmetry["_env"], obs_type="critic"
                     )
 
+                    # amended for dwaq auxiliary inputs
+                    true_velocity_obs_batch, _ = data_augmentation_func(
+                        obs=true_velocity_obs_batch, actions=None, env=self.symmetry["_env"], obs_type="aux_true_vel"
+                    )
+                    proprio_hist_batch, _ = data_augmentation_func(
+                        obs=proprio_hist_batch, actions=None, env=self.symmetry["_env"], obs_type="aux_proprio_hist"
+                    )
+                    next_propprio_batch, _ = data_augmentation_func(
+                        obs=next_propprio_batch, actions=None, env=self.symmetry["_env"], obs_type="aux_next_proprio"
+                    )
+                    gt_heightmap_obs_batch, _ = data_augmentation_func(
+                        obs=gt_heightmap_obs_batch, actions=None, env=self.symmetry["_env"], obs_type="aux_heightmap",
+                    )
+
                     num_aug = int(obs_batch.shape[0] / original_batch_size)
 
                     old_actions_log_prob_batch = self._repeat_on_batch_dim(old_actions_log_prob_batch, num_aug, False)
                     target_values_batch       = self._repeat_on_batch_dim(target_values_batch,       num_aug, False)
                     advantages_batch          = self._repeat_on_batch_dim(advantages_batch,          num_aug, False)
                     returns_batch             = self._repeat_on_batch_dim(returns_batch,             num_aug, False)
+
+                    # DWAQ auxiliary inputs
+                    next_obs_valid_batch    = self._repeat_on_batch_dim(next_obs_valid_batch, num_aug, False)
+                    p_boot_mask_batch          = self._repeat_on_batch_dim(p_boot_mask_batch, num_aug, False)
             # Recompute actions log prob and entropy for current batch of transitions
             # Note: we need to do this because we updated the policy with the new parameters
             # -- actor
@@ -637,72 +654,74 @@ class PPO_DWAQPP:
 
             # Symmetry loss
             if self.symmetry:
-                raise NotImplementedError("Symmetry loss is not implemented yet.")
-                # # obtain the symmetric actions
-                # if not self.symmetry["use_data_augmentation"]:
-                #     data_augmentation_func = self.symmetry["data_augmentation_func"]
-                #     obs_batch, _ = data_augmentation_func(
-                #         obs=obs_batch, actions=None, env=self.symmetry["_env"], obs_type="policy"
-                #     )
-                #     # compute number of augmentations per sample (MLP 假設 batch 在 dim=0)
-                #     num_aug = int(obs_batch.shape[0] / original_batch_size)
+                # obtain the symmetric actions
+                if not self.symmetry["use_data_augmentation"]:
+                    data_augmentation_func = self.symmetry["data_augmentation_func"]
+                    obs_batch, _ = data_augmentation_func(
+                        obs=obs_batch, actions=None, env=self.symmetry["_env"], obs_type="policy"
+                    )
+                    # compute number of augmentations per sample (MLP 假設 batch 在 dim=0)
+                    num_aug = int(obs_batch.shape[0] / original_batch_size)
 
-                # data_augmentation_func = self.symmetry["data_augmentation_func"]
-                # mse_loss = torch.nn.MSELoss()
+                data_augmentation_func = self.symmetry["data_augmentation_func"]
+                mse_loss = torch.nn.MSELoss()
 
-                # if self.policy.is_recurrent:
-                #     # -------------------------
-                #     # RNN case: obs_batch is (T, B_aug, D)
-                #     # -------------------------
-                #     # 用 batch-mode 跑序列
-                #     # 直接用，不要再 forward
-                #     mean_actions_batch = self.policy.action_mean.detach()  # (T, B_aug, A)
+                if self.policy.is_recurrent:
+                    # -------------------------
+                    # RNN case: obs_batch is (T, B_aug, D)
+                    # -------------------------
+                    # 用 batch-mode 跑序列
+                    # 直接用，不要再 forward
+                    mean_actions_batch = self.policy.action_mean.detach()  # (T, B_aug, A)
 
-                #     # 原始 batch 大小 B0（第一份 augmentation）
-                #     B_aug = mean_actions_batch.shape[1]
-                #     B0 = B_aug // num_aug
+                    # 原始 batch 大小 B0（第一份 augmentation）
+                    B_aug = mean_actions_batch.shape[1]
+                    B0 = B_aug // num_aug
 
-                #     action_mean_orig = mean_actions_batch[:, :B0, :]  # (T, B0, A)
+                    action_mean_orig = mean_actions_batch[:, :B0, :]  # (T, B0, A)
 
-                #     # 對 action 做同樣 augmentation（actions-only call）
-                #     _, actions_mean_symm_batch = data_augmentation_func(
-                #         obs=None, actions=action_mean_orig, env=self.symmetry["_env"], obs_type="policy"
-                #     )
-                #     # actions_mean_symm_batch 期望是 (T, B_aug, A)，且第二份是 mirror(orig)
-                #     symmetry_loss = mse_loss(
-                #         mean_actions_batch[:, B0:, :],              # policy 在 mirrored obs 上的 mean action
-                #         actions_mean_symm_batch.detach()[:, B0:, :] # mirror(orig_mean_action)
-                #     )
+                    # 對 action 做同樣 augmentation（actions-only call）
+                    _, actions_mean_symm_batch = data_augmentation_func(
+                        obs=None, actions=action_mean_orig, env=self.symmetry["_env"], obs_type="policy"
+                    )
+                    # actions_mean_symm_batch 期望是 (T, B_aug, A)，且第二份是 mirror(orig)
+                    symmetry_loss = mse_loss(
+                        mean_actions_batch[:, B0:, :],              # policy 在 mirrored obs 上的 mean action
+                        actions_mean_symm_batch.detach()[:, B0:, :] # mirror(orig_mean_action)
+                    )
 
-                # else:
-                #     # -------------------------
-                #     # MLP case: obs_batch is (B_aug, D)
-                #     # -------------------------
-                #     mean_actions_batch = self.policy.act_inference(obs_batch.detach().clone())
-                #     action_mean_orig = mean_actions_batch[:original_batch_size]
-                #     _, actions_mean_symm_batch = data_augmentation_func(
-                #         obs=None, actions=action_mean_orig, env=self.symmetry["_env"], obs_type="policy"
-                #     )
-                #     symmetry_loss = mse_loss(
-                #         mean_actions_batch[original_batch_size:],
-                #         actions_mean_symm_batch.detach()[original_batch_size:],
-                #     )
+                else:
+                    # -------------------------
+                    # MLP case: obs_batch is (B_aug, D)
+                    # -------------------------
+                    mean_actions_batch = self.policy.action_mean.detach()  # ( B_aug, A)
+                    
+                    action_mean_orig = mean_actions_batch[:original_batch_size]
+                    _, actions_mean_symm_batch = data_augmentation_func(
+                        obs=None, actions=action_mean_orig, env=self.symmetry["_env"], obs_type="policy"
+                    )
+                    symmetry_loss = mse_loss(
+                        mean_actions_batch[original_batch_size:],
+                        actions_mean_symm_batch.detach()[original_batch_size:],
+                    )
 
-                # # add the loss to the total loss
-                # if self.symmetry["use_mirror_loss"]:
-                #     loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
-                # else:
-                #     symmetry_loss = symmetry_loss.detach()
+                # add the loss to the total loss
+                if self.symmetry["use_mirror_loss"]:
+                    loss += self.symmetry["mirror_loss_coeff"] * symmetry_loss
+                else:
+                    symmetry_loss = symmetry_loss.detach()
 
 
             # Random Network Distillation loss
             if self.rnd:
-                # predict the embedding and the target
-                predicted_embedding = self.rnd.predictor(rnd_state_batch)
-                target_embedding = self.rnd.target(rnd_state_batch).detach()
-                # compute the loss as the mean squared error
-                mseloss = torch.nn.MSELoss()
-                rnd_loss = mseloss(predicted_embedding, target_embedding)
+                # # predict the embedding and the target
+                # predicted_embedding = self.rnd.predictor(rnd_state_batch)
+                # target_embedding = self.rnd.target(rnd_state_batch).detach()
+                # # compute the loss as the mean squared error
+                # mseloss = torch.nn.MSELoss()
+                # rnd_loss = mseloss(predicted_embedding, target_embedding)
+                # ===v2===
+                rnd_loss = self.rnd.compute_loss(rnd_state_batch)
 
             # Compute the gradients
             # -- For PPO
@@ -749,8 +768,7 @@ class PPO_DWAQPP:
                 mean_rnd_loss += rnd_loss.item()
             # -- Symmetry loss
             if mean_symmetry_loss is not None:
-                raise NotImplementedError("Symmetry loss is not implemented yet.")
-                # mean_symmetry_loss += symmetry_loss.item()
+                mean_symmetry_loss += symmetry_loss.item()
 
         # -- For PPO
         num_updates = self.num_learning_epochs * self.num_mini_batches
